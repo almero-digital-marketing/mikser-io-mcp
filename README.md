@@ -1,50 +1,45 @@
 # mikser-io-mcp
 
-MCP (Model Context Protocol) substrate and tools for [mikser-io](https://github.com/almero-digital-marketing/mikser-io), extracted from core into its own package so MCP can iterate on its own release cadence without forcing a mikser-io version bump on every change.
+MCP (Model Context Protocol) substrate and tools for [mikser-io](https://github.com/almero-digital-marketing/mikser-io). Ships as a plugin (not in core) so MCP can iterate on its own release cadence without forcing a mikser-io version bump on every change.
 
-## Status
+## What it ships
 
-**Scaffold.** The plugin loads cleanly but exposes nothing yet. Functionality is being migrated here from `mikser-io/src/mcp.js` (the substrate, the HTTP transport, the built-in `mikser://` resources, `mikser_ping`) and from `mikser-io/src/plugins/preview.js` (the MCP-UI half: the `ui://mikser/preview-ui-shell` resource, `mikser_preview_ui`, `mikser_ui_action`, `forwardToHandler`).
+- **The MCP substrate** — `createMcpSubstrate`, per-session McpServer + transport via `mountMcpOnExpress`, the pino-to-MCP log bridge `wireLoggerToMcp`. Other plugins compose against `runtime.options.mcp` to register their own tools and resources.
+- **Built-in resources** — `mikser://config`, `mikser://lifecycle`, `mikser://logs`, `mikser://server`. Read-only introspection any MCP client can use.
+- **Built-in tools** — `mikser_ping` (liveness + identity), `mikser_query_entities` / `mikser_read_entity` / `mikser_update_entity` / `mikser_delete_entity` / `mikser_render` (catalog CRUD + render over the engine's public catalog API), `mikser_refs_inbound` / `mikser_refs_outbound` / `mikser_refs_broken` / `mikser_refs_rename` (reverse-reference graph from `runtime.refs`), `mikser_layouts_inspect` (template + variables + sample entities for a layout).
+- **The MCP-UI surface** — `ui://mikser/preview-ui-shell` resource (MCP Apps spec shell), `mikser_preview_ui` (render an entity's `mcpUi` layout to the spec), `mikser_ui_action` (action delivery + optional HMAC-signed webhook forwarding), `mcp-ui/modes` resource for layout discovery, plus `mikser_preview_render` for rendering an entity through the pipeline and returning a clickable preview URL.
 
-While that migration is in progress, mikser's MCP still lives in core and works there. This package exists so the new home is reserved and importable.
+## Install
 
-## Why a separate package?
+```bash
+npm install mikser-io-mcp
+```
 
-Three reasons, in order of weight:
+Peer dependencies: `mikser-io ^8.2.0`, `zod ^4.0.0`.
 
-1. **Release cadence.** MCP — and especially the MCP Apps spec — is iterating faster than mikser's core engine. A spec bump or a tool reshape shouldn't force a mikser-io patch / minor / major release. With MCP as a plugin, the engine stays stable while MCP moves.
-2. **Optional.** Not every mikser project needs MCP. Keeping it in core meant every install paid for the [`@modelcontextprotocol/sdk`](https://www.npmjs.com/package/@modelcontextprotocol/sdk) dependency and its transitive deps; as a plugin it's opt-in.
-3. **Scoped review.** When something changes in MCP-land (a new spec extension, a host bug), the diff lives in one place and reviewers know the surface area.
+## Activate
 
-## When it's done
+Add `'mcp'` to your mikser project's plugins array. **List it FIRST** — the plugin factory creates `runtime.options.mcp` synchronously so any plugins that register tools (api, layouts, refs, vector, etc.) can gate on it at their own `onLoaded` hook:
 
 ```js
 // mikser.config.js
 export default {
-  plugins: [
-    'documents',
-    'files',
-    'layouts',
-    // ... your renderers
-    'mcp',          // ← the plugin (this package)
-  ],
-  mcp: {
-    base: '/mcp',
-    endpoints: {
-      // same shape as mikser's current mcp.endpoints config
+    plugins: ['mcp', /* … your other plugins */],
+    mcp: {
+        path: '/mcp',          // optional; default '/mcp' (also serves as the base for `endpoints` below)
+        endpoints: { /* … */ } // optional; same shape as the in-core era
     },
-  },
 }
 ```
 
-CLI flags (`--mcp`, `--mcp <path>`) and the `runtime.options.mcp` substrate API will be preserved.
+If `runtime.config.mcp` is absent the plugin runs as a no-op (loads but creates no substrate, mounts no transport). That lets you list `'mcp'` in plugins without forcing config.
 
-## Roadmap
+Run mikser with `--server`; the MCP transport mounts at the configured path on the same Express server the api / preview / data plugins use.
 
-- **Phase 1** — scaffold (this commit). Empty plugin, loads cleanly.
-- **Phase 2** — migrate the substrate (`createMcpSubstrate`, `mountMcpOnExpress`, `wireLoggerToMcp`, built-in `mikser://` resources, `mikser_ping`) from mikser-io core.
-- **Phase 3** — migrate the MCP-UI surface (`ui://mikser/preview-ui-shell`, `mikser_preview_ui`, `mikser_ui_action`, `forwardToHandler`) from `mikser-io`'s preview plugin.
-- **Phase 4** — drop the MCP code from mikser-io core. Pick a hard cut (`mikser-io 9.0.0`) or a transition window where both work.
+## Documentation
+
+- [Full MCP tour, twelve worked scenarios, every tool and resource](./documentation/mcp.md)
+- [ADR-0008 — MCP-UI rendering and action delivery](./documentation/decisions/0008-mcp-ui-action-delivery.md)
 
 ## License
 

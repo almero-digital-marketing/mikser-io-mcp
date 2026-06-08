@@ -256,51 +256,52 @@ describe('endpoint filters (createServer with allowedTools / allowedResources)',
     // registerResource), so we wrap McpServer constructor to return our
     // fake. Easier: just use a substrate's bind() directly.
 
-    it('allowedTools = ["mikser_api_*"] only registers tools matching the glob', () => {
+    it('allowedTools = ["mikser_*_entity"] only registers tools matching the glob', () => {
         const substrate = createMcpSubstrate()
         // Built-in mikser_ping is already registered. Add a few more.
-        substrate.simpleTool('mikser_api_list_entities', 'desc', {}, async () => ({}))
-        substrate.simpleTool('mikser_api_render',        'desc', {}, async () => ({}))
-        substrate.simpleTool('mikser_layouts_inspect',   'desc', {}, async () => ({}))
-        substrate.simpleTool('mikser_preview_render',    'desc', {}, async () => ({}))
+        substrate.simpleTool('mikser_read_entity',    'desc', {}, async () => ({}))
+        substrate.simpleTool('mikser_update_entity',  'desc', {}, async () => ({}))
+        substrate.simpleTool('mikser_render',         'desc', {}, async () => ({}))
+        substrate.simpleTool('mikser_layouts_inspect','desc', {}, async () => ({}))
+        substrate.simpleTool('mikser_preview_render', 'desc', {}, async () => ({}))
 
         // createServer uses the real McpServer — but tools/list survives
         // as a registered Map on the server. We instead intercept by
         // attaching a fake as a registration recorder AFTER all tools
-        // exist. Then createServer({ allowedTools: ['mikser_api_*'] })
+        // exist. Then createServer({ allowedTools: ['mikser_*_entity'] })
         // returns a real McpServer whose registered tool count we can
         // inspect via the SDK's internal map. Reach into _registeredTools.
-        const server = substrate.createServer({ allowedTools: ['mikser_api_*'] })
+        const server = substrate.createServer({ allowedTools: ['mikser_*_entity'] })
         // The SDK stores tools at server._registeredTools (object map).
         const toolNames = Object.keys(server._registeredTools)
-        assert.deepEqual(toolNames.sort(), ['mikser_api_list_entities', 'mikser_api_render'])
+        assert.deepEqual(toolNames.sort(), ['mikser_read_entity', 'mikser_update_entity'])
     })
 
     it('allowedTools = "*" registers everything', () => {
         const substrate = createMcpSubstrate()
-        substrate.simpleTool('mikser_api_render',     'desc', {}, async () => ({}))
+        substrate.simpleTool('mikser_render',     'desc', {}, async () => ({}))
         substrate.simpleTool('mikser_layouts_inspect','desc', {}, async () => ({}))
 
         const server = substrate.createServer({ allowedTools: '*' })
         const toolNames = Object.keys(server._registeredTools)
         assert.ok(toolNames.includes('mikser_ping'))
-        assert.ok(toolNames.includes('mikser_api_render'))
+        assert.ok(toolNames.includes('mikser_render'))
         assert.ok(toolNames.includes('mikser_layouts_inspect'))
     })
 
     it('omitting allowedTools (= undefined) registers everything', () => {
         const substrate = createMcpSubstrate()
-        substrate.simpleTool('mikser_api_render', 'desc', {}, async () => ({}))
+        substrate.simpleTool('mikser_render', 'desc', {}, async () => ({}))
 
         const server = substrate.createServer()
         const toolNames = Object.keys(server._registeredTools)
         assert.ok(toolNames.includes('mikser_ping'))
-        assert.ok(toolNames.includes('mikser_api_render'))
+        assert.ok(toolNames.includes('mikser_render'))
     })
 
     it('allowedTools = [] registers nothing — but still allows mikser_ping if listed', () => {
         const substrate = createMcpSubstrate()
-        substrate.simpleTool('mikser_api_render', 'desc', {}, async () => ({}))
+        substrate.simpleTool('mikser_render', 'desc', {}, async () => ({}))
 
         const onlyPing = substrate.createServer({ allowedTools: ['mikser_ping'] })
         const onlyPingNames = Object.keys(onlyPing._registeredTools)

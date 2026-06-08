@@ -1,6 +1,6 @@
 # MCP — talking to mikser from AI
 
-Mikser ships an [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server in core. Enable it with `--mcp` and any MCP-compatible client — Claude Desktop, Claude Code, ChatGPT, a custom agent — can drive mikser the same way a developer would: list entities, read content, write new files, render layouts, watch logs as they happen.
+The `mikser-io-mcp` plugin lets any MCP-compatible client — Claude Desktop, Claude Code, ChatGPT, a custom agent — drive mikser the same way a developer would: list entities, read content, write new files, render layouts, watch logs as they happen.
 
 This page is a tour: what MCP is in mikser-shaped terms, how to turn it on, what tools are available out of the box, and ten end-to-end scenarios from "preview an invoice" to "audit my entire catalog."
 
@@ -12,22 +12,32 @@ Two channels:
 
 2. **Logs** — every line mikser writes to its pino logger is broadcast as a `notifications/message` to every connected MCP client. When an AI builds a doc and the render fails, the AI sees the same `Render error: /documents/about.md ...` line that you would see in your terminal.
 
-The transport is HTTP — the `--mcp [path]` option mounts the MCP endpoint on the same Express app that `--server` creates. Default path is `/mcp`. Same CORS, same port, same lifecycle.
+The transport is HTTP — the plugin mounts the MCP endpoint on the same Express app that `--server` creates. Default path is `/mcp`. Same CORS, same port, same lifecycle.
 
 > **Trust model.** MCP is in-process. Whoever can reach the `/mcp` endpoint already controls the engine — no per-tool token check, no per-endpoint scope. The HTTP `/api` plane keeps its token gate; that's for *frontends*. For untrusted AI access, put `/mcp` behind your reverse proxy's auth layer.
 
 ## Turning it on
 
+Add `'mcp'` to your `mikser.config.js` plugins array — **list it FIRST** so its factory creates `runtime.options.mcp` before any other plugin's `onLoaded` fires:
+
+```js
+// mikser.config.js
+export default {
+    plugins: ['mcp', /* ...your other plugins */],
+    mcp: {
+        path: '/mcp',          // optional; default '/mcp'
+        // endpoints: { ... }  // optional; per-endpoint token + scope config (next section)
+    },
+}
+```
+
 ```bash
-# Default port (3001) and path (/mcp), open (no token):
-mikser --server --mcp
+# Default port (3001), default path (/mcp), open (no token):
+mikser --server
 
-# Custom path:
-mikser --server --mcp /ai
-
-# Programmatic:
+# Programmatic embedding:
 import { setup } from 'mikser-io'
-await setup({ server: 3001, mcp: true })
+await setup({ server: 3001 })   // mcp comes from the plugins config
 ```
 
 > **Single open endpoint is fine for loopback dev. For anything past loopback (ngrok, public reverse proxy, shared LAN) configure endpoints with tokens — next section.**
@@ -67,8 +77,8 @@ mcp: {
         public: {
             tools: [
                 'mikser_ping',
-                'mikser_api_list_entities',
-                'mikser_api_read_entity',
+                'mikser_query_entities',
+                'mikser_read_entity',
                 'mikser_layouts_inspect',
             ],
             // No token → no auth header required
@@ -100,10 +110,9 @@ Endpoint options:
 
 Glob patterns are useful because tool names embed plugin ownership:
 
-- `mikser_api_*` — every tool from the api plugin
+- `mikser_refs_*` — every reverse-reference graph tool
 - `mikser_layouts_*` — every tool from the layouts plugin
-- `mikser_*_render` — render-style actions across plugins (api's and preview's)
-- `mikser_*_read*` — any read-shaped action (read_entity today, more later)
+- `mikser_*_entity` — read/update/delete-entity actions
 - `mikser_*` — everything mikser exposes
 
 ### Client configuration
@@ -188,11 +197,11 @@ Tool ownership follows the plugin that owns the concept. Core ships one tool (th
 
 | Tool                  | What it does                                                                          |
 | --------------------- | ------------------------------------------------------------------------------------- |
-| `mikser_api_list_entities`| Paginated list of catalog entities with sift-compatible filter, sort, projection.     |
-| `mikser_api_read_entity`  | Read one entity by id. Pass `include: ["content"]` to also fetch the source file (text formats only). |
-| `mikser_api_update_entity`| Write/overwrite a content file inside a collection. Triggers a new lifecycle cycle.   |
-| `mikser_api_delete_entity`| Remove a content file from a collection.                                              |
-| `mikser_api_render`       | Render a transient entity through the full pipeline and return the produced bytes.    |
+| `mikser_query_entities`| Paginated list of catalog entities with sift-compatible filter, sort, projection.     |
+| `mikser_read_entity`  | Read one entity by id. Pass `include: ["content"]` to also fetch the source file (text formats only). |
+| `mikser_update_entity`| Write/overwrite a content file inside a collection. Triggers a new lifecycle cycle.   |
+| `mikser_delete_entity`| Remove a content file from a collection.                                              |
+| `mikser_render`       | Render a transient entity through the full pipeline and return the produced bytes.    |
 
 **`layouts` plugin** (template introspection):
 
@@ -461,7 +470,7 @@ mcpUi:
 </script>
 ```
 
-Note the diff-on-submit: the layout sends only the fields the user actually changed. The agent's next step is `mikser_api_update_entity({ id: entityId, patch: payload.seo })` — surgical writes, no clobbering.
+Note the diff-on-submit: the layout sends only the fields the user actually changed. The agent's next step is `mikser_update_entity({ id: entityId, patch: payload.seo })` — surgical writes, no clobbering.
 
 #### 5. Multi-select picker — tags (Eta)
 
@@ -653,7 +662,7 @@ The seven examples above lean on the same conventions. Worth naming them so they
 - **Send only what changed.** Multi-field forms (#4) should diff against the initial values and post only the deltas. Single-state toggles (#2, #6) send the target state, not the current state. Wizards (#7) send the merged final answers. Smaller payloads are cheaper for the agent to reason about.
 - **Style inline, ship self-contained.** No external CSS, no web fonts, no analytics — the default MCP Apps CSP is `default-src 'none'; connect-src 'none'`. The shell's only outbound channel is `postMessage` to the host. System fonts (`font-family: system-ui`) and inline `<style>` are fine; everything else has to be embedded.
 - **Use the layout body to compute what the agent shouldn't.** Example #2's payload pre-computes the *new* publish state. Example #4 pre-computes the diff. Pushing logic to render-time means the agent receives ready-to-act-on data rather than raw inputs it has to interpret.
-- **Don't smuggle long content through the payload.** If the user types a 2000-word note, send back a reference id and call `mikser_api_read_entity` later — not as a single huge `payload.note` string. Tool results live in the agent's context window.
+- **Don't smuggle long content through the payload.** If the user types a 2000-word note, send back a reference id and call `mikser_read_entity` later — not as a single huge `payload.note` string. Tool results live in the agent's context window.
 - **For external workflows, declare `mcpUi.handler.url` instead of teaching the agent the schema.** When a layout's action should hit your application server (Slack notification, JIRA transition, queue), set `handler.url` in the frontmatter. `mikser_ui_action` POSTs the action to that URL (HMAC-signed if `handler.secret` is set) and uses the response as the tool result. The agent stays generic; the application semantics stay in your service. Mikser stays a content engine.
 
 These conventions aren't enforced by the engine — they're just what makes layouts compose with agents cleanly. The contract is the MCP Apps spec; mikser's role is to ship the shell (`ui://mikser/preview-ui-shell`), render the layout against the entity, and accept the resulting `tools/call`. Application semantics live either in the agent (pure-relay) or in your `handler.url` webhook — never in mikser.
@@ -687,7 +696,7 @@ These are written as the conversation an operator would have with their AI. The 
 The AI translates the request into a single filter call:
 
 ```json
-→ mikser_api_list_entities {
+→ mikser_query_entities {
     "filter": { "collection": "documents", "meta.published": true, "meta.lang": "en" },
     "sort": { "meta.date": -1 },
     "fields": ["id", "meta.title", "meta.date"],
@@ -702,10 +711,10 @@ The `fields` projection keeps the response small; the AI gets back a summary lis
 Two-step: fetch the entity, then render it through the engine.
 
 ```json
-→ mikser_api_read_entity { "id": "/documents/about.md" }
+→ mikser_read_entity { "id": "/documents/about.md" }
 ← { meta: {...}, content: "..." }
 
-→ mikser_api_render { "entity": { ...the entity from step 1... }, "options": { "save": false } }
+→ mikser_render { "entity": { ...the entity from step 1... }, "options": { "save": false } }
 ← { content: [{ type: "resource", resource: { mimeType: "text/html", text: "<html>..." } }] }
 ```
 
@@ -714,13 +723,13 @@ Two-step: fetch the entity, then render it through the engine.
 ### 3. "Create a draft invoice layout and preview it with this customer data."
 
 ```json
-→ mikser_api_update_entity {
+→ mikser_update_entity {
     "collection": "layouts",
     "relativePath": "invoice-draft.hbs",
     "content": "<!DOCTYPE html>\n<h1>Invoice {{number}}</h1>\n..."
   }
 
-→ mikser_api_render {
+→ mikser_render {
     "entity": {
       "id": "/preview/invoice-1.json",
       "collection": "documents",
@@ -736,19 +745,19 @@ Two-step: fetch the entity, then render it through the engine.
 
 ### 4. "Add this image to my files folder and use it in the homepage."
 
-Files in mikser are just files on disk, so the AI uses `mikser_api_update_entity` for both writes:
+Files in mikser are just files on disk, so the AI uses `mikser_update_entity` for both writes:
 
 ```json
-→ mikser_api_update_entity {
+→ mikser_update_entity {
     "collection": "files",
     "relativePath": "images/hero.svg",
     "content": "<svg xmlns='http://www.w3.org/2000/svg'>...</svg>"
   }
 
-→ mikser_api_read_entity { "id": "/documents/index.md" }
+→ mikser_read_entity { "id": "/documents/index.md" }
 ← { meta: { hero: null, ... }, content: "..." }
 
-→ mikser_api_update_entity {
+→ mikser_update_entity {
     "collection": "documents",
     "relativePath": "index.md",
     "content": "---\nhero: /files/images/hero.svg\n---\n# Welcome\n..."
@@ -760,7 +769,7 @@ The next lifecycle cycle picks up both writes, re-renders the homepage with the 
 ### 5. "Find every page that mentions our old company name."
 
 ```json
-→ mikser_api_list_entities {
+→ mikser_query_entities {
     "filter": { "content": { "$regex": "Acme Corp", "$options": "i" } },
     "fields": ["id", "meta.title"]
   }
@@ -776,14 +785,14 @@ The AI doesn't have to call anything special. The moment its session is initiali
 Render error: /documents/about.md (layouts/main.hbs:14:8) Helper "fmtDate" not defined
 ```
 
-…lands in the AI's context the instant it happens. The AI can then call `mikser_api_read_entity` on `/layouts/main.hbs` to look at line 14 and propose a fix.
+…lands in the AI's context the instant it happens. The AI can then call `mikser_read_entity` on `/layouts/main.hbs` to look at line 14 and propose a fix.
 
 ### 7. "Convert all my Markdown frontmatter from `date` to `publishedAt`."
 
 The AI walks the catalog, reads each doc, rewrites it, and writes it back. No special migration tool — the same five verbs.
 
 ```json
-→ mikser_api_list_entities {
+→ mikser_query_entities {
     "filter": { "collection": "documents", "format": "md", "meta.date": { "$exists": true } },
     "fields": ["id"],
     "limit": 100
@@ -791,8 +800,8 @@ The AI walks the catalog, reads each doc, rewrites it, and writes it back. No sp
 ← { items: [{ id: "/documents/2025/launch.md" }, ...] }
 
 # For each:
-→ mikser_api_read_entity { "id": "/documents/2025/launch.md" }
-→ mikser_api_update_entity {
+→ mikser_read_entity { "id": "/documents/2025/launch.md" }
+→ mikser_update_entity {
     "collection": "documents",
     "relativePath": "2025/launch.md",
     "content": "---\npublishedAt: 2025-04-12\n---\n# Launch\n..."
@@ -807,7 +816,7 @@ If the AI gets it wrong on the first file, the user sees the diff in chat before
 → mikser_ping
 ← { name: "mikser-io", version: "...", started: true, activeClients: 1 }
 
-→ mikser_api_list_entities { "filter": { "id": "/documents/nav.yml" }, "fields": ["stamp", "time"] }
+→ mikser_query_entities { "filter": { "id": "/documents/nav.yml" }, "fields": ["stamp", "time"] }
 ```
 
 The AI checks the entity's `stamp` (last source change) against `time` (last cycle processed) and notices they're equal — there's nothing new to render. It can then check what *triggers* a nav refresh in the layouts and propose adding an explicit `runtime.process()` call.
@@ -815,14 +824,14 @@ The AI checks the entity's `stamp` (last source change) against `time` (last cyc
 ### 9. "Clean up old test fixtures from the documents folder."
 
 ```json
-→ mikser_api_list_entities {
+→ mikser_query_entities {
     "filter": { "collection": "documents", "id": { "$regex": "^/documents/test-" } },
     "fields": ["id"]
   }
 ← { items: [{ id: "/documents/test-x.md" }, ...] }
 
 # For each:
-→ mikser_api_delete_entity { "collection": "documents", "relativePath": "test-x.md" }
+→ mikser_delete_entity { "collection": "documents", "relativePath": "test-x.md" }
 ```
 
 Each delete removes the source file *and* prunes its rendered outputs from the manifest on the next cycle. The AI can ask for confirmation before destructive batches.
@@ -830,7 +839,7 @@ Each delete removes the source file *and* prunes its rendered outputs from the m
 ### 10. "Generate a sitemap of every published doc, grouped by language."
 
 ```json
-→ mikser_api_list_entities {
+→ mikser_query_entities {
     "filter": { "meta.published": true },
     "sort": { "meta.lang": 1, "meta.date": -1 },
     "fields": ["id", "meta.title", "meta.lang", "meta.href"],
@@ -841,7 +850,7 @@ Each delete removes the source file *and* prunes its rendered outputs from the m
 The AI groups the response by `meta.lang` and writes a single sitemap document back:
 
 ```json
-→ mikser_api_update_entity {
+→ mikser_update_entity {
     "collection": "documents",
     "relativePath": "sitemap.json",
     "content": "{\n  \"en\": [...],\n  \"bg\": [...]\n}"
@@ -851,9 +860,9 @@ The AI groups the response by `meta.lang` and writes a single sitemap document b
 ### 11. "Generate three layout variants for the same hero section. Show me previews."
 
 ```json
-→ mikser_api_update_entity { "collection": "layouts", "relativePath": "hero-a.hbs", "content": "<!-- centered version -->..." }
-→ mikser_api_update_entity { "collection": "layouts", "relativePath": "hero-b.hbs", "content": "<!-- left-aligned with image -->..." }
-→ mikser_api_update_entity { "collection": "layouts", "relativePath": "hero-c.hbs", "content": "<!-- full-bleed video -->..." }
+→ mikser_update_entity { "collection": "layouts", "relativePath": "hero-a.hbs", "content": "<!-- centered version -->..." }
+→ mikser_update_entity { "collection": "layouts", "relativePath": "hero-b.hbs", "content": "<!-- left-aligned with image -->..." }
+→ mikser_update_entity { "collection": "layouts", "relativePath": "hero-c.hbs", "content": "<!-- full-bleed video -->..." }
 
 → mikser_preview_render { "entity": { "id": "/preview-a.json", "collection": "documents", "format": "json", "meta": { "layout": "hero-a" } } }
 → mikser_preview_render { "entity": { "id": "/preview-b.json", "collection": "documents", "format": "json", "meta": { "layout": "hero-b" } } }
@@ -865,7 +874,7 @@ Three writes + three renders, three HTML previews in the chat. The user picks on
 ### 12. "Audit my site for missing meta descriptions."
 
 ```json
-→ mikser_api_list_entities {
+→ mikser_query_entities {
     "filter": { "collection": "documents", "$or": [
       { "meta.description": { "$exists": false } },
       { "meta.description": "" }
@@ -874,7 +883,7 @@ Three writes + three renders, three HTML previews in the chat. The user picks on
   }
 ```
 
-The AI gets the list, can `mikser_api_read_entity` each one to read its content, draft a description, and propose the edits in batch.
+The AI gets the list, can `mikser_read_entity` each one to read its content, draft a description, and propose the edits in batch.
 
 ## Plugin authors: registering your own tools
 
@@ -901,7 +910,7 @@ export default (core) => {
 }
 ```
 
-`whenMcpActive` only fires when the engine was started with `--mcp` — no need to guard manually. Tools registered after the substrate is up propagate to every already-connected client via `notifications/tools/list_changed`.
+`whenMcpActive` only fires when `runtime.options.mcp` is set (the `mcp` plugin is loaded) — no need to guard manually. Tools registered after the substrate is up propagate to every already-connected client via `notifications/tools/list_changed`.
 
 For the full surface — `registerTool`, `registerResource`, `registerPrompt` — see the [MCP SDK docs](https://github.com/modelcontextprotocol/typescript-sdk).
 
@@ -909,15 +918,15 @@ For the full surface — `registerTool`, `registerResource`, `registerPrompt` �
 
 Mikser is single-tenant. The catalog, the file system, the lifecycle — there's one of each. The MCP substrate honors that: when multiple AI clients connect, they all see the same catalog state and they all receive every log line. There is no per-client view of "your" data.
 
-The practical implication: if two clients call `mikser_api_update_entity` for the same file in the same second, the second write wins. No locking, no merge — same semantics as two editors saving the same file.
+The practical implication: if two clients call `mikser_update_entity` for the same file in the same second, the second write wins. No locking, no merge — same semantics as two editors saving the same file.
 
 ## Limitations and pitfalls
 
-- **No streaming render output.** `mikser_api_render` returns the complete output as a single tool response. For very large renders (multi-MB PDFs), this is fine for chat clients but inappropriate as a load-bearing API. Use the HTTP `/api/<endpoint>/render` route for that.
-- **No undo.** `mikser_api_delete_entity` is final. Wrap destructive flows in your client's confirmation UI.
-- **Resources are not entities.** Four `mikser://` introspection resources ship with core — `mikser://lifecycle`, `mikser://runtime`, `mikser://config`, `mikser://logs/recent` — and surface engine state (current phase, options, merged config, rolling 500-line log buffer). They're for introspection, not catalog content. Don't conflate them with `mikser_api_read_entity`.
+- **No streaming render output.** `mikser_render` returns the complete output as a single tool response. For very large renders (multi-MB PDFs), this is fine for chat clients but inappropriate as a load-bearing API. Use the HTTP `/api/<endpoint>/render` route for that.
+- **No undo.** `mikser_delete_entity` is final. Wrap destructive flows in your client's confirmation UI.
+- **Resources are not entities.** Four `mikser://` introspection resources ship with core — `mikser://lifecycle`, `mikser://runtime`, `mikser://config`, `mikser://logs/recent` — and surface engine state (current phase, options, merged config, rolling 500-line log buffer). They're for introspection, not catalog content. Don't conflate them with `mikser_read_entity`.
 - **Late tool registration.** Plugins that register tools deep in `onLoaded` will only appear after their hook runs. Until then, `tools/list` won't include them. Clients should re-list on `notifications/tools/list_changed`.
 
-## Why this is in core, not a plugin
+## Why this is a plugin, not in core
 
-See [ADR-0006](./decisions/0006-when-to-add-to-core.md). The short version: MCP is a transport (like HTTP), not domain logic. Every plugin wants the same instance. A plugin-of-plugins would be the wrong shape — same reasoning as why Express is engine-owned.
+See [ADR-0006](./decisions/0006-when-to-add-to-core.md). The short version: MCP is substrate (like HTTP) — every plugin wants the same instance, a plugin-of-plugins would be the wrong shape — but the MCP spec, SDKs, and host clients iterate weekly while the engine ships stable. Coupling MCP releases to engine releases drags both. Shipping as `mikser-io-mcp` decouples cadence: engine bumps stay rare; MCP bumps match the spec's pace.

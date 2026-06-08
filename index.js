@@ -14,22 +14,32 @@
 //     Client-side filtering is honored via the SDK's per-session
 //     `logging/setLevel` state.
 //
-// History: this lived in mikser-io/src/mcp.js until 8.2.0, when it was
-// extracted into a plugin so MCP could iterate on its own release
-// cadence. See documentation/decisions/0006-when-to-add-to-core.md
-// (in mikser-io) for the original placement justification and this
-// repo's MIGRATION.md for the rationale for moving out.
+// MCP ships as a plugin (not in core) so its release cadence can move
+// at the pace of the MCP spec / SDKs / host clients without dragging
+// engine releases. See mikser-io's ADR-0006 for the rule (test #5,
+// release-cadence) that put it here.
 import { randomUUID } from 'node:crypto'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { minimatch } from 'minimatch'
-import { runtime, isLoopback } from 'mikser-io'
+import { z } from 'zod'
+import {
+    runtime,
+    isLoopback,
+    refExists,
+    mimeForEntity,
+    readEntityContent,
+    useRenderer,
+    useCollection,
+    queryEntities,
+    readEntity,
+} from 'mikser-io'
 import packageInfo from 'mikser-io/package.json' with { type: 'json' }
 import previewPlugin from './preview.js'
 
 // Pattern matcher for endpoint tools/resources filters. Accepts
 // '*', an array of patterns, or undefined (= allow all). Glob
-// patterns like 'mikser_api_*' or 'mikser_*_render' work through
+// patterns like 'mikser_refs_*' or 'mikser_*_entity' work through
 // minimatch — same library mikser uses for content matching, so
 // the syntax is consistent across the codebase.
 function matchesAny(name, patterns) {
@@ -175,7 +185,7 @@ export function createMcpSubstrate() {
         // the transport mount per new session.
         //
         // Filters take patterns (exact name or glob via minimatch):
-        //   allowedTools:     ['mikser_api_*', 'mikser_ping']
+        //   allowedTools:     ['mikser_refs_*', 'mikser_ping']
         //   allowedResources: ['mikser://lifecycle', 'mikser://logs/*']
         // Omit a filter (or pass '*') to allow everything in that
         // category — that's the backward-compat default.
@@ -707,6 +717,348 @@ export default (core) => {
                 runtime.options.mcpPath,
             )
         }
+    })
+
+    // mikser_refs_* tool surface. Pure transport over runtime.refs — the
+    // engine owns the inverse-reference index (mikser-io/src/refs.js);
+    // this just wraps four queries and one resource in the MCP shape.
+    // runtime.refs is created in refs.js's onInitialized hook (runs
+    // before any onLoaded), so the surface is guaranteed present here.
+    // Guarded anyway: if the engine boots without refs the registrations
+    // are silently skipped.
+    onLoaded(() => {
+        const logger = useLogger()
+        const mcp = runtime.options.mcp
+        if (!runtime.refs) {
+            logger.debug('mikser_refs_* tools skipped: runtime.refs not initialized')
+            return
+        }
+
+        const ok = (data) => ({
+            content: [{
+                type: 'text',
+                text: typeof data === 'string' ? data : JSON.stringify(data, null, 2),
+            }],
+        })
+        const fail = (msg) => ({ isError: true, content: [{ type: 'text', text: msg }] })
+
+        mcp.simpleTool(
+            'mikser_refs_inbound',
+            'List entities that reference the given href. Returns every (entity id, field path) pair pointing at this target. Use for "what would break if I delete this?" or "show me everything that mentions /authors/dick." The query is exact-match against the canonical ref value as written in source $-keys.',
+            {
+                ref: z.string().describe('Reference value to look up. Match is exact on the source-file form (e.g. "/authors/dick"). Hrefs, not catalog ids.'),
+            },
+            async ({ ref }) => {
+                try {
+                    if (!ref) return fail('ref is required')
+                    const entries = runtime.refs.inboundFor(ref)
+                    return ok({ ref, count: entries.length, entries })
+                } catch (err) {
+                    logger.error('MCP mikser_refs_inbound error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        mcp.simpleTool(
+            'mikser_refs_outbound',
+            'List the references emitted by the given entity. Returns every $-keyed field on the entity and the ref string it carries. Use for "what does this entity link to?" or "show me the relationship graph rooted at /blog/launch.md."',
+            {
+                id: z.string().describe('Catalog id of the source entity (e.g. "/documents/blog/launch.md").'),
+            },
+            async ({ id }) => {
+                try {
+                    if (!id) return fail('id is required')
+                    const entries = runtime.refs.outboundFor(id)
+                    return ok({ id, count: entries.length, entries })
+                } catch (err) {
+                    logger.error('MCP mikser_refs_outbound error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        mcp.simpleTool(
+            'mikser_refs_broken',
+            'List all references that do not currently resolve to an entity. Walks every ref in the inverse index and tests each via the catalog. Use for build-time health checks, editor "broken links" panels, or CI gates.',
+            {},
+            async () => {
+                try {
+                    const broken = []
+                    for (const ref of runtime.refs.allRefs()) {
+                        const exists = await refExists(ref)
+                        if (!exists) {
+                            broken.push({ ref, sources: runtime.refs.inboundFor(ref) })
+                        }
+                    }
+                    return ok({ count: broken.length, broken })
+                } catch (err) {
+                    logger.error('MCP mikser_refs_broken error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        mcp.simpleTool(
+            'mikser_refs_rename',
+            'Rewrite every reference to `from` so it points at `to`. Walks the inverse index for `from`, opens each referencing source file, and rewrites the `$`-keyed value via writeEntity. The watcher picks up each rewrite and the catalog re-syncs on the next cycle. Returns the list of (entity id, fields) pairs that were updated. Idempotent — calling twice with the same args is a no-op on the second call because the first call drained the inbound list.',
+            {
+                from: z.string().describe('Old reference value as written in source files (e.g. "/authors/dick").'),
+                to:   z.string().describe('New reference value to write in its place (e.g. "/authors/dick-marinov").'),
+            },
+            async ({ from, to }) => {
+                try {
+                    const result = await runtime.refs.rename({ from, to })
+                    return ok(result)
+                } catch (err) {
+                    logger.error('MCP mikser_refs_rename error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        try {
+            mcp.registerResource(
+                'mikser-refs-index',
+                'mikser://refs/index',
+                {
+                    title: 'Reverse-reference index',
+                    description: 'Read-only snapshot of the engine\'s inverse-reference index. Lists every reference in the catalog and the entities that emit it.',
+                    mimeType: 'application/json',
+                },
+                async (uri) => ({
+                    contents: [{
+                        uri: uri.href,
+                        mimeType: 'application/json',
+                        text: JSON.stringify({
+                            stats: runtime.refs.size(),
+                            refs: runtime.refs.allRefs().map(ref => ({
+                                ref,
+                                sources: runtime.refs.inboundFor(ref),
+                            })),
+                        }, null, 2),
+                    }],
+                }),
+            )
+        } catch (err) {
+            logger.debug('mikser://refs/index registration skipped: %s', err.message)
+        }
+
+        logger.debug('MCP tools registered: mikser_refs_{inbound,outbound,broken,rename} (mcp plugin)')
+    })
+
+    // mikser_layouts_inspect — wraps runtime.options.layouts.inspect()
+    // (exposed by the core layouts plugin) in the MCP tool envelope.
+    // The domain knowledge — what counts as a layout, how to parse
+    // liquid/handlebars/eta references — lives in the layouts plugin;
+    // this is just the schema + transport + author-hint notes.
+    onLoaded(() => {
+        const logger = useLogger()
+        const mcp = runtime.options.mcp
+        if (!runtime.options.layouts?.inspect) {
+            logger.debug('mikser_layouts_inspect skipped: runtime.options.layouts.inspect not exposed (layouts plugin not loaded?)')
+            return
+        }
+
+        mcp.simpleTool(
+            'mikser_layouts_inspect',
+            'Inspect a layout: template source, variables it references, the postprocessor it produces, and sample entities currently using it. Use this to answer "what data does this layout need?" before drafting a preview render — saves a guess-and-render-empty cycle.',
+            {
+                id: z.string().describe('Layout id, e.g. "/layouts/reports/royalty.html-pdf.liquid". Use mikser_query_entities with { collection: "layouts" } to discover ids.'),
+                samples: z.number().int().min(0).max(10).optional().describe('How many existing entities currently using this layout to include as data-shape examples. Default 3. Only entities with explicit meta.layout match; auto-matched layouts are not surfaced.'),
+            },
+            async ({ id, samples = 3 }) => {
+                try {
+                    const result = await runtime.options.layouts.inspect(id, { samples })
+                    return {
+                        content: [{
+                            type: 'text',
+                            text: JSON.stringify({
+                                ...result,
+                                notes: [
+                                    'references.variables is a naive regex pass across liquid/handlebars/eta — false positives possible, but covers the common `{{ document.meta.X }}` and `<%= entity.X %>` patterns.',
+                                    'samples only includes entities with explicit meta.layout. Auto-matched layouts are not listed; use mikser_query_entities with a filename-pattern filter for those.',
+                                ],
+                            }, null, 2),
+                        }],
+                    }
+                } catch (err) {
+                    logger.error('MCP mikser_layouts_inspect error: %s', err.message)
+                    return {
+                        isError: true,
+                        content: [{ type: 'text', text: err.message }],
+                    }
+                }
+            },
+        )
+
+        logger.debug('MCP tool registered: mikser_layouts_inspect (mcp plugin)')
+    })
+
+    // Catalog + render tool surface. Five tools wrapping the engine's
+    // catalog operations (queryEntities / readEntity from
+    // mikser-io/src/catalog.js, useCollection.write/.remove for the
+    // mutating pair) and a render tool backed by an mcp-owned renderer
+    // instance.
+    //
+    // Catalog ops are direct mikser-io imports — no plugin-surface
+    // dependency, no presence check. The catalog is created during
+    // onInitialized (lifecycle phase before any onLoaded), so by the
+    // time this hook fires it's always ready.
+    //
+    // Render gets its own renderer here with `runtime.config.mcp.renderTimeout`
+    // (or 30s default) — independent of `runtime.config.api.renderTimeout`
+    // which governs HTTP endpoint behavior. MCP request lifecycles and
+    // HTTP request lifecycles can want different timeouts.
+    //
+    onLoaded(() => {
+        const logger = useLogger()
+        const mcp = runtime.options.mcp
+
+        const { render: mcpRender } = useRenderer(runtime, {
+            defaultTimeout: runtime.config.mcp?.renderTimeout ?? 30_000,
+        })
+
+        const ok = (data) => ({
+            content: [{
+                type: 'text',
+                text: typeof data === 'string' ? data : JSON.stringify(data, null, 2),
+            }],
+        })
+        const fail = (msg) => ({ isError: true, content: [{ type: 'text', text: msg }] })
+
+        mcp.simpleTool(
+            'mikser_query_entities',
+            'Query entities from mikser\'s catalog with optional filter / sort / projection. Use this for "show me all documents about X" or "what entities are in collection Y." Returns paginated results. Pass `expand` to inline referenced entities (per ADR-0007): paths like "author", "author.organization", or "sections.*.image" walk through $-keyed reference fields and replace the ref string with the resolved entity in one round-trip.',
+            {
+                filter: z.record(z.any()).optional().describe('Mongo-style filter (sift-compatible). Defaults to no filter — every entity.'),
+                sort:   z.record(z.number()).optional().describe('Sort spec, e.g. { "meta.date": -1, "name": 1 }.'),
+                fields: z.array(z.string()).optional().describe('Dotted-path projection. Omit to return whole entities.'),
+                skip:   z.number().int().min(0).optional().describe('Skip N items.'),
+                limit:  z.number().int().min(1).max(100).optional().describe('Page size, defaults to 25, capped at 100.'),
+                expand: z.array(z.string()).optional().describe('Inline-expand referenced entities. Each entry is a dotted path that walks through $-keyed reference fields, replacing the ref string with the resolved entity. Use `*` for array iteration. Examples: ["author"], ["author.organization"], ["sections.*.image"]. Default caps: maxDepth 5, maxPaths 20, maxResolved 100 per request.'),
+            },
+            async ({ filter, sort, fields, skip, limit, expand }) => {
+                try {
+                    return ok(await queryEntities({ filter, sort, fields, skip, limit, expand }))
+                } catch (err) {
+                    logger.error('MCP mikser_query_entities error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        mcp.simpleTool(
+            'mikser_read_entity',
+            'Read a single entity by its catalog id (e.g. "/documents/about.md"). Returns the full entity record or null when not found. Pass include: ["content"] to also fetch the source file content from disk — useful for reading a layout template, document frontmatter+body, or any text-format source without dropping out to the filesystem. Binary formats (png/pdf/mp4/etc.) get a `contentSkipped` hint pointing at mikser_render instead of decoded bytes. Pass `expand` to inline referenced entities in the response (per ADR-0007): paths like "author", "author.organization", or "sections.*.image" replace the ref string with the resolved entity in one trip.',
+            {
+                id: z.string().describe('Catalog id of the entity to read.'),
+                include: z.array(z.enum(['content'])).optional().describe('Optional list of extra fields to populate. Currently only "content" is supported: reads the file at entity.uri as utf8 and attaches it as .content. Binary formats get `contentSkipped` instead of garbage utf8.'),
+                expand: z.array(z.string()).optional().describe('Inline-expand referenced entities. Each entry is a dotted path through $-keyed reference fields. Use `*` for array iteration. Examples: ["author"], ["author.organization"], ["sections.*.image"]. Same caps as mikser_query_entities.'),
+            },
+            async ({ id, include, expand }) => {
+                try {
+                    const entity = await readEntity({ id, expand })
+                    if (entity && include?.includes('content')) {
+                        // readEntityContent gates on text-extension and
+                        // attaches one of { content, contentError,
+                        // contentSkipped } — single source of truth on
+                        // what "load this entity's content" means,
+                        // shared across any consumer that wants the
+                        // text/binary gate.
+                        Object.assign(entity, await readEntityContent(entity))
+                    }
+                    return ok(entity)
+                } catch (err) {
+                    logger.error('MCP mikser_read_entity error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        mcp.simpleTool(
+            'mikser_update_entity',
+            'Create or update a content file inside a mikser collection. The file is written to disk and the next lifecycle cycle picks it up. Use this to author new documents, layouts, or other content from AI.',
+            {
+                collection:   z.string().describe('Collection name (e.g. "documents", "layouts").'),
+                relativePath: z.string().describe('Path relative to the collection folder (e.g. "blog/2026-06-02-launch.md").'),
+                content:      z.string().optional().describe('File content to write. Frontmatter is parsed by the corresponding plugin.'),
+            },
+            async ({ collection, relativePath, content = '' }) => {
+                try {
+                    await useCollection(runtime, collection).write(relativePath, content)
+                    return ok({ ok: true, collection, relativePath })
+                } catch (err) {
+                    logger.error('MCP mikser_update_entity error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        mcp.simpleTool(
+            'mikser_delete_entity',
+            'Remove a content file from a mikser collection. Deletes the source file; the next lifecycle cycle prunes its rendered outputs from the manifest.',
+            {
+                collection:   z.string().describe('Collection name.'),
+                relativePath: z.string().describe('Path relative to the collection folder.'),
+            },
+            async ({ collection, relativePath }) => {
+                try {
+                    await useCollection(runtime, collection).remove(relativePath)
+                    return ok({ ok: true, collection, relativePath })
+                } catch (err) {
+                    logger.error('MCP mikser_delete_entity error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        mcp.simpleTool(
+            'mikser_render',
+            'Render a transient entity through the engine pipeline (parse → layouts → resources → render → postprocess) and return the FINAL produced bytes. Use this for "preview this layout against this data" without writing the entity to disk. The returned bytes are the pipeline\'s final output — PDF for a `*.html-pdf.*` layout, MJML-derived HTML for `*.html-mjml.*`, etc. Set options.save=false to skip the disk write; options.catalog=false to prune the catalog row after rendering. For a clickable preview URL instead of raw bytes, use mikser_preview_render (preview plugin).',
+            {
+                entity:  z.record(z.any()).describe('Entity shape with at least { id, collection } and any meta/content the renderer needs.'),
+                options: z.record(z.any()).optional().describe('Renderer options: { save: false, catalog: false, renderer: "...", postprocessor: "..." }.'),
+            },
+            async ({ entity = {}, options = {} }) => {
+                try {
+                    const { output, entity: rendered } = await mcpRender(entity, options)
+                    const result = output?.result
+                    if (result == null) {
+                        return ok({ ok: true, entity: rendered, output: null })
+                    }
+                    const mime = mimeForEntity(rendered) ?? 'application/octet-stream'
+                    if (Buffer.isBuffer(result)) {
+                        return {
+                            content: [{
+                                type: 'resource',
+                                resource: {
+                                    uri: `mikser://render/${rendered.id ?? 'inline'}`,
+                                    mimeType: mime,
+                                    blob: result.toString('base64'),
+                                },
+                            }],
+                        }
+                    }
+                    // String result — most renderers (HTML, MJML, etc.).
+                    return {
+                        content: [{
+                            type: 'resource',
+                            resource: {
+                                uri: `mikser://render/${rendered.id ?? 'inline'}`,
+                                mimeType: mime,
+                                text: String(result),
+                            },
+                        }],
+                    }
+                } catch (err) {
+                    logger.error('MCP mikser_render error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        logger.debug('MCP tools registered: mikser_{query_entities,read_entity,update_entity,delete_entity,render} (mcp plugin)')
     })
 
     return { name: 'mcp' }

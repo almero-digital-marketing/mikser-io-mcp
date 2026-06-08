@@ -1,23 +1,26 @@
-// MCP-UI surface for mikser-io-mcp.
+// MCP-UI surface for mikser-io-mcp. Registers everything that
+// surfaces UI through MCP: the shell resource, the discovery resource
+// for mcpUi modes, the mikser_preview_ui tool (with _meta.ui.resourceUri
+// pointing at the shell), the mikser_ui_action tool (with
+// _meta.ui.visibility=['app']), the forwardToHandler webhook helper,
+// and the mikser_preview_render tool that streams pipeline output via
+// the in-memory preview cache.
 //
-// This file is the MCP-UI half of what used to live in
-// mikser-io/src/plugins/preview.js. It registers everything that
-// surfaces UI through MCP: the shell resource, the discovery
-// resource for mcpUi modes, the mikser_preview_ui tool (with
-// _meta.ui.resourceUri pointing at the shell), the mikser_ui_action
-// tool (with _meta.ui.visibility=['app']), the forwardToHandler
-// webhook helper, and the mikser_preview_render tool that streams
-// pipeline output via the in-memory preview cache.
-//
-// The cache itself lives in mikser-io core's preview plugin
-// (runtime.options.preview.{store, get, stats, config}). This
-// module reaches into it via that surface — no cross-plugin
-// imports.
+// The cache itself lives in mikser-io's preview plugin
+// (runtime.options.preview.{store, get, stats, config}). This module
+// reaches into it via that surface — no cross-plugin imports.
 
 import path from 'node:path'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { randomUUID, createHmac } from 'node:crypto'
 import { z } from 'zod'
 import { useRenderer, mimeForEntity, matchEntity } from 'mikser-io'
+
+// Resolve a path relative to this module's file. Used to find the
+// public/ folder regardless of where the package is installed (works
+// in node_modules, file: deps, npm-link setups, etc.).
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // Forward an MCP-UI action to an external handler URL. Returns the
 // handler's JSON response, which becomes the tool result. Throws on
@@ -114,153 +117,7 @@ export async function forwardToHandler(handler, body) {
 // the entity (mikser's strength) — they just produce *body content*, not
 // full HTML documents. The shell handles the protocol; layouts handle the
 // content. See documentation/decisions/0008-mcp-ui-action-delivery.md.
-const PREVIEW_UI_SHELL_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>mikser · MCP-UI</title>
-<style>
-  body { margin: 0; font-family: system-ui, -apple-system, sans-serif; color: #1f2937; background: #ffffff; }
-  #mikser-ui-root { padding: 0; }
-  #mikser-debug {
-    display: none;
-    position: fixed;
-    bottom: 0; left: 0; right: 0;
-    max-height: 30vh;
-    overflow: auto;
-    padding: 0.5em 1em;
-    border-top: 1px solid #d1d5db;
-    background: #f9fafb;
-    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
-    color: #4b5563;
-    z-index: 9999;
-  }
-  #mikser-debug.shown { display: block; }
-  #mikser-debug strong { display: block; margin-bottom: 0.3em; color: #374151; font: 600 11px ui-sans-serif, system-ui; text-transform: uppercase; letter-spacing: 0.04em; }
-  #mikser-debug ol { margin: 0; padding: 0; list-style: none; }
-  #mikser-debug li { padding: 1px 0; }
-  #mikser-debug li.ok { color: #047857; }
-  #mikser-debug li.fail { color: #b91c1c; }
-  #mikser-debug .t { color: #9ca3af; margin-right: 0.4em; }
-</style>
-</head>
-<body>
-  <div id="mikser-ui-root"></div>
-  <div id="mikser-debug">
-    <strong>mikser · MCP Apps protocol</strong>
-    <ol id="mikser-debug-log"></ol>
-  </div>
-<script>
-(function () {
-  var nextId = 1, hostOrigin = '*';
-  var pending = new Map();
-  var debugLog = document.getElementById('mikser-debug-log');
-  var debugPanel = document.getElementById('mikser-debug');
-  var t0 = Date.now();
-  var ctx = { entityId: null, layoutId: null };
-
-  function log(msg, cls) {
-    debugPanel.classList.add('shown');
-    var li = document.createElement('li');
-    if (cls) li.className = cls;
-    var dt = ((Date.now() - t0) / 1000).toFixed(2);
-    li.innerHTML = '<span class="t">+' + dt + 's</span>' + msg;
-    debugLog.appendChild(li);
-  }
-
-  function rpc(method, params, timeoutMs) {
-    return new Promise(function (resolve, reject) {
-      var id = nextId++;
-      pending.set(id, { resolve: resolve, reject: reject });
-      log('→ ' + method + ' (id=' + id + ')');
-      window.parent.postMessage({ jsonrpc: '2.0', method: method, params: params, id: id }, hostOrigin);
-      if (timeoutMs) {
-        setTimeout(function () {
-          if (!pending.has(id)) return;
-          pending.delete(id);
-          log('✗ ' + method + ' — no reply after ' + timeoutMs + 'ms', 'fail');
-          reject(new Error(method + ' timeout (' + timeoutMs + 'ms — host did not reply)'));
-        }, timeoutMs);
-      }
-    });
-  }
-
-  function injectContent(structured) {
-    if (!structured) { log('tool-result had no structuredContent', 'fail'); return; }
-    ctx.entityId = structured.entityId || null;
-    ctx.layoutId = structured.layoutId || null;
-    var root = document.getElementById('mikser-ui-root');
-    root.innerHTML = structured.html || '';
-    // innerHTML doesn't execute embedded <script> tags — re-create them.
-    Array.prototype.forEach.call(root.querySelectorAll('script'), function (oldScript) {
-      var newScript = document.createElement('script');
-      Array.prototype.forEach.call(oldScript.attributes, function (a) {
-        newScript.setAttribute(a.name, a.value);
-      });
-      newScript.textContent = oldScript.textContent;
-      oldScript.parentNode.replaceChild(newScript, oldScript);
-    });
-    log('✓ content injected (' + (structured.html || '').length + ' bytes, entityId=' + JSON.stringify(ctx.entityId) + ')', 'ok');
-  }
-
-  window.addEventListener('message', function (e) {
-    var data = e.data;
-    if (data && typeof data.id !== 'undefined' && pending.has(data.id)) {
-      var entry = pending.get(data.id);
-      pending.delete(data.id);
-      if (data.error) entry.reject(data.error);
-      else entry.resolve(data.result);
-      return;
-    }
-    if (data && data.method === 'ui/notifications/tool-result') {
-      log('← ui/notifications/tool-result');
-      injectContent(data.params && data.params.structuredContent);
-      return;
-    }
-  });
-
-  // Public API. Layouts call this from button click handlers to deliver
-  // an action back to mikser. Returns a Promise that resolves with
-  // mikser_ui_action's tool result (pure relay or handler-forwarded).
-  window.sendAction = function (action, payload) {
-    payload = payload || {};
-    log('sendAction: ' + action);
-    return rpc('tools/call', {
-      name: 'mikser_ui_action',
-      arguments: {
-        entityId: ctx.entityId,
-        layoutId: ctx.layoutId,
-        action: action,
-        payload: payload,
-      },
-    }, 5000).then(function (r) {
-      log('✓ mikser_ui_action returned', 'ok');
-      return r;
-    }).catch(function (err) {
-      log('✗ mikser_ui_action failed: ' + err.message, 'fail');
-      throw err;
-    });
-  };
-
-  // Handshake — sent immediately on load. If the host doesn't reply,
-  // content will still inject when tool-result arrives, but clicks
-  // won't deliver (no AppBridge translating tools/call frames).
-  log('shell loaded');
-  rpc('ui/initialize', {
-    appCapabilities: { availableDisplayModes: ['inline'] },
-  }, 2000).then(function (init) {
-    var hostName = (init && init.hostInfo && init.hostInfo.name) || 'unknown';
-    log('✓ ui/initialize replied — host=' + hostName, 'ok');
-    if (init && init.hostInfo && init.hostInfo.origin) {
-      hostOrigin = init.hostInfo.origin;
-    }
-  }).catch(function () {
-    log('Diagnosis: host did NOT respond to ui/initialize. The MCP Apps AppBridge is not implemented (or disabled) on this host. Click actions will not reach mikser. See ADR-0008.', 'fail');
-  });
-})();
-</script>
-</body>
-</html>`
+const PREVIEW_UI_SHELL_HTML = readFileSync(path.join(__dirname, "public", "preview-ui-shell.html"), "utf8")
 
 // Plugin function — invoked by mikser-io-mcp/index.js's factory after
 // the substrate is set up. Registers the MCP-UI surface (shell + modes
@@ -291,10 +148,10 @@ export default ({
         // engine-supplied Express app) so the URL is reachable.
         mcp.simpleTool(
             'mikser_preview_render',
-            'Render an entity through the engine pipeline AND surface the FINAL output as a clickable URL served by the running --server. Use this instead of mikser_api_render when the user needs to see the result in a browser. The URL serves the pipeline\'s final output — PDF for a `*.html-pdf.*` layout, MJML-derived HTML for `*.html-mjml.*`, etc. Requires --server. Previews live in memory (not on disk, never under outputFolder) and auto-expire — default 10 minutes, clamped 30..3600 seconds.',
+            'Render an entity through the engine pipeline AND surface the FINAL output as a clickable URL served by the running --server. Use this instead of mikser_render when the user needs to see the result in a browser. The URL serves the pipeline\'s final output — PDF for a `*.html-pdf.*` layout, MJML-derived HTML for `*.html-mjml.*`, etc. Requires --server. Previews live in memory (not on disk, never under outputFolder) and auto-expire — default 10 minutes, clamped 30..3600 seconds.',
             {
-                entity:  z.record(z.any()).describe('Entity shape with at least { id, collection } and any meta/content the renderer needs. Same shape as mikser_api_render.'),
-                options: z.record(z.any()).optional().describe('Renderer options. Same as mikser_api_render, plus { expiresInSeconds: number = 600 } controlling preview TTL.'),
+                entity:  z.record(z.any()).describe('Entity shape with at least { id, collection } and any meta/content the renderer needs. Same shape as mikser_render.'),
+                options: z.record(z.any()).optional().describe('Renderer options. Same as mikser_render, plus { expiresInSeconds: number = 600 } controlling preview TTL.'),
             },
             async ({ entity = {}, options = {} }) => {
                 const logger = useLogger()
@@ -309,7 +166,7 @@ export default ({
 
                 try {
                     if (!runtime.options.port) {
-                        return fail('mikser_preview_render requires --server to be running so the preview URL is reachable. Use mikser_api_render to get raw bytes inline instead.')
+                        return fail('mikser_preview_render requires --server to be running so the preview URL is reachable. Use mikser_render to get raw bytes inline instead.')
                     }
                     if (!preview) {
                         return fail('mikser_preview_render requires the preview cache. Ensure mikser-io core is loaded and runtime.options.preview is available.')

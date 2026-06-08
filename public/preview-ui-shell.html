@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>mikser · MCP-UI</title>
+<style>
+  body { margin: 0; font-family: system-ui, -apple-system, sans-serif; color: #1f2937; background: #ffffff; }
+  #mikser-ui-root { padding: 0; }
+  #mikser-debug {
+    display: none;
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    max-height: 30vh;
+    overflow: auto;
+    padding: 0.5em 1em;
+    border-top: 1px solid #d1d5db;
+    background: #f9fafb;
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #4b5563;
+    z-index: 9999;
+  }
+  #mikser-debug.shown { display: block; }
+  #mikser-debug strong { display: block; margin-bottom: 0.3em; color: #374151; font: 600 11px ui-sans-serif, system-ui; text-transform: uppercase; letter-spacing: 0.04em; }
+  #mikser-debug ol { margin: 0; padding: 0; list-style: none; }
+  #mikser-debug li { padding: 1px 0; }
+  #mikser-debug li.ok { color: #047857; }
+  #mikser-debug li.fail { color: #b91c1c; }
+  #mikser-debug .t { color: #9ca3af; margin-right: 0.4em; }
+</style>
+</head>
+<body>
+  <div id="mikser-ui-root"></div>
+  <div id="mikser-debug">
+    <strong>mikser · MCP Apps protocol</strong>
+    <ol id="mikser-debug-log"></ol>
+  </div>
+<script>
+(function () {
+  var nextId = 1, hostOrigin = '*';
+  var pending = new Map();
+  var debugLog = document.getElementById('mikser-debug-log');
+  var debugPanel = document.getElementById('mikser-debug');
+  var t0 = Date.now();
+  var ctx = { entityId: null, layoutId: null };
+
+  function log(msg, cls) {
+    debugPanel.classList.add('shown');
+    var li = document.createElement('li');
+    if (cls) li.className = cls;
+    var dt = ((Date.now() - t0) / 1000).toFixed(2);
+    li.innerHTML = '<span class="t">+' + dt + 's</span>' + msg;
+    debugLog.appendChild(li);
+  }
+
+  function rpc(method, params, timeoutMs) {
+    return new Promise(function (resolve, reject) {
+      var id = nextId++;
+      pending.set(id, { resolve: resolve, reject: reject });
+      log('→ ' + method + ' (id=' + id + ')');
+      window.parent.postMessage({ jsonrpc: '2.0', method: method, params: params, id: id }, hostOrigin);
+      if (timeoutMs) {
+        setTimeout(function () {
+          if (!pending.has(id)) return;
+          pending.delete(id);
+          log('✗ ' + method + ' — no reply after ' + timeoutMs + 'ms', 'fail');
+          reject(new Error(method + ' timeout (' + timeoutMs + 'ms — host did not reply)'));
+        }, timeoutMs);
+      }
+    });
+  }
+
+  function injectContent(structured) {
+    if (!structured) { log('tool-result had no structuredContent', 'fail'); return; }
+    ctx.entityId = structured.entityId || null;
+    ctx.layoutId = structured.layoutId || null;
+    var root = document.getElementById('mikser-ui-root');
+    root.innerHTML = structured.html || '';
+    // innerHTML doesn't execute embedded <script> tags — re-create them.
+    Array.prototype.forEach.call(root.querySelectorAll('script'), function (oldScript) {
+      var newScript = document.createElement('script');
+      Array.prototype.forEach.call(oldScript.attributes, function (a) {
+        newScript.setAttribute(a.name, a.value);
+      });
+      newScript.textContent = oldScript.textContent;
+      oldScript.parentNode.replaceChild(newScript, oldScript);
+    });
+    log('✓ content injected (' + (structured.html || '').length + ' bytes, entityId=' + JSON.stringify(ctx.entityId) + ')', 'ok');
+  }
+
+  window.addEventListener('message', function (e) {
+    var data = e.data;
+    if (data && typeof data.id !== 'undefined' && pending.has(data.id)) {
+      var entry = pending.get(data.id);
+      pending.delete(data.id);
+      if (data.error) entry.reject(data.error);
+      else entry.resolve(data.result);
+      return;
+    }
+    if (data && data.method === 'ui/notifications/tool-result') {
+      log('← ui/notifications/tool-result');
+      injectContent(data.params && data.params.structuredContent);
+      return;
+    }
+  });
+
+  // Public API. Layouts call this from button click handlers to deliver
+  // an action back to mikser. Returns a Promise that resolves with
+  // mikser_ui_action's tool result (pure relay or handler-forwarded).
+  window.sendAction = function (action, payload) {
+    payload = payload || {};
+    log('sendAction: ' + action);
+    return rpc('tools/call', {
+      name: 'mikser_ui_action',
+      arguments: {
+        entityId: ctx.entityId,
+        layoutId: ctx.layoutId,
+        action: action,
+        payload: payload,
+      },
+    }, 5000).then(function (r) {
+      log('✓ mikser_ui_action returned', 'ok');
+      return r;
+    }).catch(function (err) {
+      log('✗ mikser_ui_action failed: ' + err.message, 'fail');
+      throw err;
+    });
+  };
+
+  // Handshake — sent immediately on load. If the host doesn't reply,
+  // content will still inject when tool-result arrives, but clicks
+  // won't deliver (no AppBridge translating tools/call frames).
+  log('shell loaded');
+  rpc('ui/initialize', {
+    appCapabilities: { availableDisplayModes: ['inline'] },
+  }, 2000).then(function (init) {
+    var hostName = (init && init.hostInfo && init.hostInfo.name) || 'unknown';
+    log('✓ ui/initialize replied — host=' + hostName, 'ok');
+    if (init && init.hostInfo && init.hostInfo.origin) {
+      hostOrigin = init.hostInfo.origin;
+    }
+  }).catch(function () {
+    log('Diagnosis: host did NOT respond to ui/initialize. The MCP Apps AppBridge is not implemented (or disabled) on this host. Click actions will not reach mikser. See ADR-0008.', 'fail');
+  });
+})();
+</script>
+</body>
+</html>
