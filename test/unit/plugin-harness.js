@@ -20,7 +20,7 @@ const ACTION = {
     DELETE: 'delete',
     TRIGGER: 'trigger',
 }
-const TASKS = { QUEUE: 'queue', WORKER: 'worker', POOL: 'pool' }
+const TASKS = { INLINE: 'inline', SERIAL: 'serial', WORKER: 'worker' }
 
 export function createHarness({
     config = {},
