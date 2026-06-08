@@ -1,0 +1,36 @@
+{
+  "name": "mikser-io-mcp",
+  "version": "0.1.0",
+  "description": "MCP (Model Context Protocol) substrate and tools for mikser-io. Extracted from core to iterate on its own release cadence.",
+  "main": "index.js",
+  "type": "module",
+  "files": [
+    "index.js",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test:unit": "node --test --test-reporter=spec 'test/unit/**/*.test.js'"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/almero-digital-marketing/mikser-io-mcp.git"
+  },
+  "keywords": [
+    "mikser",
+    "mikser-io",
+    "mcp",
+    "model-context-protocol",
+    "ai-agent"
+  ],
+  "author": "",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/almero-digital-marketing/mikser-io-mcp/issues"
+  },
+  "homepage": "https://github.com/almero-digital-marketing/mikser-io-mcp#readme",
+  "peerDependencies": {
+    "mikser-io": "^8.0.0"
+  }
+}
