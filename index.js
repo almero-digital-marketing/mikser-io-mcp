@@ -655,9 +655,11 @@ function pinoLevelNumber(name) {
 //     endpoints: { ... }             // same shape as the previous mcp.endpoints
 //   }
 //
-// If runtime.config.mcp is absent, the plugin runs as a no-op (loads
-// but creates no substrate, mounts no transport). Lets users include
-// 'mcp' in plugins without forcing them to also provide config.
+// Presence in the plugins array IS the activation signal. The `mcp`
+// config block is for tuning (path, endpoints, renderTimeout). When
+// absent, defaults apply. For conditional activation, toggle the
+// plugins array — `...(process.env.MCP ? ['mcp'] : [])` — same shape
+// other plugins use.
 export default (core) => {
     // Use the runtime singleton imported above for substrate-internal
     // code paths (createMcpSubstrate etc. reference it directly via
@@ -665,10 +667,9 @@ export default (core) => {
     // they're both mikser-io's exported runtime singleton.
     const { onLoaded, useLogger } = core
 
-    if (!runtime.config.mcp) {
-        useLogger?.()?.debug('mikser-io-mcp loaded but runtime.config.mcp is absent — no substrate created')
-        return { name: 'mcp' }
-    }
+    // Default the config block so every downstream `runtime.config.mcp.X`
+    // reference Just Works without optional-chaining everywhere.
+    runtime.config.mcp = runtime.config.mcp ?? {}
 
     // Contribute MCP transport headers to engine's CORS arrays so
     // browser-side MCP clients (basic-host, mcp-ui, etc.) can read
