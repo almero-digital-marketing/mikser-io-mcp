@@ -36,6 +36,42 @@ If `runtime.config.mcp` is absent the plugin runs as a no-op (loads but creates 
 
 Run mikser with `--server`; the MCP transport mounts at the configured path on the same Express server the api / preview / data plugins use.
 
+## Register with a client
+
+Once the plugin is installed in your mikser project, the package ships a CLI you can invoke via `npx` to connect MCP-speaking clients. Connector name + description are read automatically from the project's `package.json`.
+
+### Claude Desktop
+
+```bash
+npx mikser-io-mcp register claude                                  # default URL http://localhost:3001/mcp
+npx mikser-io-mcp register claude --url http://localhost:4000/mcp  # custom port
+npx mikser-io-mcp register claude --dry-run                        # show what would change
+npx mikser-io-mcp register claude --force                          # overwrite a different existing entry
+npx mikser-io-mcp register claude --unregister                     # remove the entry
+```
+
+Writes a `mcpServers` entry into Claude Desktop's per-OS config file:
+
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%/Claude/claude_desktop_config.json`
+- Linux: `~/.config/Claude/claude_desktop_config.json`
+
+The entry launches `supergateway` (npx-installed on demand) as a stdio→streamable-HTTP bridge to your running mikser server. Fully quit + reopen Claude Desktop after registering.
+
+### ChatGPT
+
+```bash
+npx mikser-io-mcp register chatgpt --url https://YOUR-TUNNEL.example/mcp
+```
+
+ChatGPT's MCP integration is server-side — OpenAI's servers connect to your MCP endpoint directly. `localhost` is unreachable; you must expose mikser via a public tunnel (`ngrok http 3001`, Cloudflare Tunnel, etc.) before running this.
+
+The script doesn't write a file (ChatGPT has no local config). It prints the three fields (Name, Description, MCP Server URL) you paste into ChatGPT's UI: Settings → Connectors → Advanced → Developer mode → Create.
+
+Notes:
+- ChatGPT Developer mode + custom MCP connectors are **beta** and require a Plus / Pro / Business / Enterprise / Edu account.
+- Connectors don't auto-enable per chat — toggle on each new conversation.
+
 ## Documentation
 
 - [Full MCP tour, twelve worked scenarios, every tool and resource](./documentation/mcp.md)
