@@ -14,10 +14,11 @@ import { resolve } from 'node:path'
 
 function parseArgs(args) {
     const opts = {}
+    let expectUrl = false
     for (const a of args) {
         if (a.startsWith('--url=')) opts.url = a.slice(6)
-        else if (a === '--url')     opts._expectUrl = true
-        else if (opts._expectUrl)   { opts.url = a; opts._expectUrl = false }
+        else if (a === '--url')     expectUrl = true
+        else if (expectUrl)         { opts.url = a; expectUrl = false }
     }
     return opts
 }
