@@ -660,16 +660,20 @@ function pinoLevelNumber(name) {
 // absent, defaults apply. For conditional activation, toggle the
 // plugins array — `...(process.env.MCP ? ['mcp'] : [])` — same shape
 // other plugins use.
-export default (core) => {
+export function mcp(options = {}) {
+    return (core) => {
     // Use the runtime singleton imported above for substrate-internal
     // code paths (createMcpSubstrate etc. reference it directly via
     // closure). The factory arg `core.runtime` is the same object;
     // they're both mikser-io's exported runtime singleton.
     const { onLoaded, useLogger } = core
 
-    // Default the config block so every downstream `runtime.config.mcp.X`
-    // reference Just Works without optional-chaining everywhere.
-    runtime.config.mcp = runtime.config.mcp ?? {}
+    // Mirror plugin options into runtime.config.mcp so non-plugin
+    // helpers (mountMcpOnExpress and friends, called by embedders that
+    // wire MCP up directly without `plugins:`) keep finding their
+    // config there. Plugin-side reads use `options.X` and never touch
+    // runtime.config.mcp.
+    runtime.config.mcp = options
 
     // Contribute MCP transport headers to engine's CORS arrays so
     // browser-side MCP clients (basic-host, mcp-ui, etc.) can read
@@ -687,7 +691,7 @@ export default (core) => {
     // runtime.options.mcp by the time those run. The mcp plugin MUST
     // be FIRST in the user's plugins array for that contract to hold.
     runtime.options.mcp = createMcpSubstrate()
-    runtime.options.mcpPath = runtime.config.mcp.path ?? '/mcp'
+    runtime.options.mcpPath = options.path ?? '/mcp'
 
     // Compose the MCP-UI surface in the same package — shell
     // resource, mikser_preview_ui, mikser_ui_action, mikser_preview_render,
@@ -917,7 +921,7 @@ export default (core) => {
         const mcp = runtime.options.mcp
 
         const { render: mcpRender } = useRenderer(runtime, {
-            defaultTimeout: runtime.config.mcp?.renderTimeout ?? 30_000,
+            defaultTimeout: options.renderTimeout ?? 30_000,
         })
 
         const ok = (data) => ({
@@ -1063,4 +1067,5 @@ export default (core) => {
     })
 
     return { name: 'mcp' }
+    }
 }
