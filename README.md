@@ -19,20 +19,24 @@ Peer dependencies: `mikser-io ^8.2.0`, `zod ^4.0.0`.
 
 ## Activate
 
-Add `'mcp'` to your mikser project's plugins array. **List it FIRST** — the plugin factory creates `runtime.options.mcp` synchronously so any plugins that register tools (api, layouts, refs, vector, etc.) can gate on it at their own `onLoaded` hook:
+Import the `mcp` factory and call it **first** in your mikser project's plugins array — the closure runs synchronously and creates `runtime.options.mcp` so any plugins that register tools (api, layouts, refs, vector, etc.) can gate on it at their own `onLoaded` hook:
 
 ```js
 // mikser.config.js
+import { mcp } from 'mikser-io-mcp'
+
 export default {
-    plugins: ['mcp', /* … your other plugins */],
-    mcp: {
-        path: '/mcp',          // optional; default '/mcp' (also serves as the base for `endpoints` below)
-        endpoints: { /* … */ } // optional; same shape as the in-core era
-    },
+    plugins: [
+        mcp({
+            path: '/mcp',          // optional; default '/mcp' (also serves as the base for `endpoints` below)
+            endpoints: { /* … */ } // optional; same shape as the in-core era
+        }),
+        /* … your other plugins */
+    ],
 }
 ```
 
-If `runtime.config.mcp` is absent the plugin runs as a no-op (loads but creates no substrate, mounts no transport). That lets you list `'mcp'` in plugins without forcing config.
+Calling `mcp()` with no options is a no-op activation — the factory runs but creates no substrate and mounts no transport. To skip MCP entirely, leave the factory call out of `plugins`.
 
 Run mikser with `--server`; the MCP transport mounts at the configured path on the same Express server the api / preview / data plugins use.
 
