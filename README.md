@@ -15,7 +15,7 @@ MCP (Model Context Protocol) substrate and tools for [mikser-io](https://github.
 npm install mikser-io-mcp
 ```
 
-Peer dependencies: `mikser-io ^8.2.0`, `zod ^4.0.0`.
+Peer dependencies: `mikser-io ^9.0.0`, `zod ^4.0.0`.
 
 ## Activate
 
