@@ -404,9 +404,12 @@ function serverInfo() {
     const hasInternalServer = opts.server != null && opts.port != null
     const hasExternalApp = opts.app && !hasInternalServer
 
-    const base = hasInternalServer
-        ? `http://localhost:${opts.port}`
-        : null
+    // Prefer runtime.options.url (the engine-resolved public URL — CLI
+    // --url or config.url) so the URL surfaced to MCP clients is
+    // externally reachable. Falls back to localhost:port for dev /
+    // private setups where no public URL was configured.
+    const base = opts.url
+        ?? (hasInternalServer ? `http://localhost:${opts.port}` : null)
 
     return {
         running: hasInternalServer ? 'internal' : (hasExternalApp ? 'external' : 'none'),
@@ -550,12 +553,14 @@ function mountEndpoint(app, substrate, path, ep, endpointName) {
         const authLabel = ep.token
             ? 'token'
             : (ep.allowRemote ? 'public, REMOTE OPEN' : 'public, loopback-only')
-        // Print as a full URL when we know the port so the operator can
-        // copy/click straight from the log. Falls back to bare path for
-        // external-app setups where the engine doesn't own the listener.
-        const location = runtime.options.port
-            ? `http://localhost:${runtime.options.port}${path}`
-            : path
+        // Print as a full URL when we know the origin so the operator can
+        // copy/click straight from the log. Public URL (--url / config.url)
+        // wins for share-with-others; localhost is the fallback for dev.
+        // Falls back to bare path for external-app setups where the engine
+        // doesn't own the listener and no url is configured.
+        const origin = runtime.options.url
+            ?? (runtime.options.port ? `http://localhost:${runtime.options.port}` : null)
+        const location = origin ? `${origin}${path}` : path
         if (endpointName) {
             logger.info('MCP endpoint mounted: %s (tools=[%s] [%s])', location, toolsLabel, authLabel)
         } else {

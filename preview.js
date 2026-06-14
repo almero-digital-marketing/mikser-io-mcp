@@ -165,8 +165,15 @@ export default ({
                 })
 
                 try {
-                    if (!runtime.options.port) {
-                        return fail('mikser_preview_render requires --server to be running so the preview URL is reachable. Use mikser_render to get raw bytes inline instead.')
+                    // Origin: prefer the engine's public URL (--url /
+                    // config.url) — that's what an external MCP client
+                    // (Claude Desktop, Inspector, anyone not on this
+                    // box) can actually reach. Fall back to localhost
+                    // when only a port is known (dev / loopback agent).
+                    const origin = runtime.options.url
+                        ?? (runtime.options.port ? `http://localhost:${runtime.options.port}` : null)
+                    if (!origin) {
+                        return fail('mikser_preview_render requires either --url <public-url> or --server to be set so the preview URL is reachable. Use mikser_render to get raw bytes inline instead.')
                     }
                     if (!preview) {
                         return fail('mikser_preview_render requires the preview cache. Ensure mikser-io core is loaded and runtime.options.preview is available.')
@@ -192,7 +199,7 @@ export default ({
 
                     preview.store({ filename, bytes: result, mime, ttlMs: ttlSec * 1000 })
 
-                    const url = `http://localhost:${runtime.options.port}${cfg.path}/${filename}`
+                    const url = `${origin}${cfg.path}/${filename}`
                     const bytes = Buffer.isBuffer(result) ? result.length : Buffer.byteLength(result)
 
                     logger.debug('MCP mikser_preview_render cached %s (%d bytes, ttl %ds): %s', filename, bytes, ttlSec, url)
