@@ -852,53 +852,10 @@ export function mcp(options = {}) {
         logger.debug('MCP tools registered: mikser_refs_{inbound,outbound,broken,rename} (mcp plugin)')
     })
 
-    // mikser_layouts_inspect — wraps runtime.options.layouts.inspect()
-    // (exposed by the core layouts plugin) in the MCP tool envelope.
-    // The domain knowledge — what counts as a layout, how to parse
-    // liquid/handlebars/eta references — lives in the layouts plugin;
-    // this is just the schema + transport + author-hint notes.
-    onLoaded(() => {
-        const logger = useLogger()
-        const mcp = runtime.options.mcp
-        if (!runtime.options.layouts?.inspect) {
-            logger.debug('mikser_layouts_inspect skipped: runtime.options.layouts.inspect not exposed (layouts plugin not loaded?)')
-            return
-        }
-
-        mcp.simpleTool(
-            'mikser_layouts_inspect',
-            'Inspect a layout: template source, variables it references, the postprocessor it produces, and sample entities currently using it. Use this to answer "what data does this layout need?" before drafting a preview render — saves a guess-and-render-empty cycle.',
-            {
-                id: z.string().describe('Layout id, e.g. "/layouts/reports/royalty.html-pdf.liquid". Use mikser_query_entities with { collection: "layouts" } to discover ids.'),
-                samples: z.number().int().min(0).max(10).optional().describe('How many existing entities currently using this layout to include as data-shape examples. Default 3. Only entities with explicit meta.layout match; auto-matched layouts are not surfaced.'),
-            },
-            async ({ id, samples = 3 }) => {
-                try {
-                    const result = await runtime.options.layouts.inspect(id, { samples })
-                    return {
-                        content: [{
-                            type: 'text',
-                            text: JSON.stringify({
-                                ...result,
-                                notes: [
-                                    'references.variables is a naive regex pass across liquid/handlebars/eta — false positives possible, but covers the common `{{ document.meta.X }}` and `<%= entity.X %>` patterns.',
-                                    'samples only includes entities with explicit meta.layout. Auto-matched layouts are not listed; use mikser_query_entities with a filename-pattern filter for those.',
-                                ],
-                            }, null, 2),
-                        }],
-                    }
-                } catch (err) {
-                    logger.error('MCP mikser_layouts_inspect error: %s', err.message)
-                    return {
-                        isError: true,
-                        content: [{ type: 'text', text: err.message }],
-                    }
-                }
-            },
-        )
-
-        logger.debug('MCP tool registered: mikser_layouts_inspect (mcp plugin)')
-    })
+    // mikser_layouts_inspect moved out — registered by mikser-io-layouts
+    // directly against `runtime.options.mcp`, same pattern vector and
+    // schemas use. Domain-owned tools live with the domain plugin; mcp
+    // is registry + transport, not a tool catalog.
 
     // Catalog + render tool surface. Five tools wrapping the engine's
     // catalog operations (queryEntities / readEntity from
