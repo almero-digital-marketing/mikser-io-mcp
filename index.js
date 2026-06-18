@@ -33,6 +33,7 @@ import {
     useCollection,
     queryEntities,
     readEntity,
+    registerRoute,
 } from 'mikser-io'
 import packageInfo from 'mikser-io/package.json' with { type: 'json' }
 import previewPlugin from './preview.js'
@@ -540,33 +541,27 @@ function mountEndpoint(app, substrate, path, ep, endpointName) {
     app.get(path,  (req, res) => handle(req, res))
     app.delete(path, (req, res) => handle(req, res))
 
-    const logger = runtime.engine?.logger
-    if (logger) {
-        const toolsLabel = ep.tools == null || ep.tools === '*'
-            ? '*'
-            : Array.isArray(ep.tools) ? ep.tools.join(',') : String(ep.tools)
-        // Three reachability states: token (anyone with the token from
-        // anywhere), loopback-only (no token + no allowRemote, default),
-        // or REMOTE OPEN (no token + allowRemote, deliberate exposure).
-        // The all-caps "REMOTE OPEN" mirrors the boot warning style so
-        // an operator scanning startup output sees the risk.
-        const authLabel = ep.token
-            ? 'token'
-            : (ep.allowRemote ? 'public, REMOTE OPEN' : 'public, loopback-only')
-        // Print as a full URL when we know the origin so the operator can
-        // copy/click straight from the log. Public URL (--url / config.url)
-        // wins for share-with-others; localhost is the fallback for dev.
-        // Falls back to bare path for external-app setups where the engine
-        // doesn't own the listener and no url is configured.
-        const origin = runtime.options.url
-            ?? (runtime.options.port ? `http://localhost:${runtime.options.port}` : null)
-        const location = origin ? `${origin}${path}` : path
-        if (endpointName) {
-            logger.info('MCP endpoint mounted: %s (tools=[%s] [%s])', location, toolsLabel, authLabel)
-        } else {
-            logger.info('MCP mounted: %s [%s]', location, authLabel)
-        }
-    }
+    const toolsLabel = ep.tools == null || ep.tools === '*'
+        ? '*'
+        : Array.isArray(ep.tools) ? ep.tools.join(',') : String(ep.tools)
+    // Reachability → registry enum + the louder bracket. 'public' means
+    // a deliberate unauthenticated exposure (allowRemote), so keep the
+    // REMOTE OPEN warning in the log. streaming:true — the MCP
+    // Streamable HTTP transport sends SSE frames server→client, so a
+    // facade must not buffer this route.
+    const reachability = ep.token ? 'token' : (ep.allowRemote ? 'public' : 'loopback')
+    const authLabel = ep.token
+        ? 'token'
+        : (ep.allowRemote ? 'public, REMOTE OPEN' : 'loopback-only')
+    registerRoute({
+        path,
+        plugin:       'mcp',
+        reachability,
+        streaming:    true,
+        label:        endpointName ? 'MCP endpoint' : 'MCP',
+        detail:       endpointName ? `(tools=[${toolsLabel}])` : undefined,
+        authLabel,
+    })
 }
 
 /**
