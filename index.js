@@ -25,7 +25,6 @@ import { minimatch } from 'minimatch'
 import { z } from 'zod'
 import {
     runtime,
-    isLoopback,
     refExists,
     mimeForEntity,
     readEntityContent,
@@ -34,6 +33,9 @@ import {
     queryEntities,
     readEntity,
     registerRoute,
+    resolveAuth,
+    authorize,
+    reachabilityOf,
 } from 'mikser-io'
 import packageInfo from 'mikser-io/package.json' with { type: 'json' }
 import previewPlugin from './preview.js'
@@ -462,52 +464,165 @@ export async function mountMcpOnExpress(app, substrate, defaultPath = '/mcp') {
     }
 }
 
+const PROTECTED_RESOURCE = '/.well-known/oauth-protected-resource'
+
+// RFC 9728 §3 forms a resource's metadata URL by INSERTING the well-known
+// segment between host and path — https://h/mcp/admin becomes
+// https://h/.well-known/oauth-protected-resource/mcp/admin. That matters
+// here in a way it doesn't for a single-endpoint server: mikser mounts one
+// MCP endpoint per `mcp.endpoints` entry, and they can carry different
+// verifiers, so they cannot all answer at one bare well-known path.
+function metadataPath(path) {
+    return PROTECTED_RESOURCE + (path === '/' ? '' : path)
+}
+
+// Endpoints that have already claimed the bare well-known path, so a second
+// OAuth-gated endpoint doesn't silently overwrite the first one's metadata.
+const claimedRoot = new Set()
+
+// Guard the one RFC 9728 field a client refuses to accept when it's wrong.
+//
+// `resource` identifies THIS endpoint. The client fetches the metadata and
+// checks it really describes the server it connected to — otherwise any
+// resource could hand clients an authorization server of its choosing — so
+// a mismatch aborts the login before the user ever sees a page.
+//
+// The trap: a token AUDIENCE looks like the same kind of value and is not.
+// `resource` names this endpoint; an audience names who a token is for.
+// Passing the audience here produces an MCP endpoint no compliant client
+// can authenticate against, with nothing wrong in mikser's own logs.
+//
+// The origin isn't knowable at mount time (it's per-request) but the PATH
+// is, and that's enough to catch the confusion. Warn and fall back rather
+// than throw: MCP is one surface, and the fallback is the correct value.
+function checkResource(declared, path) {
+    if (!declared) return null
+    const norm = (s) => s.replace(/\/+$/, '') || '/'
+    let pathname
+    try {
+        pathname = new URL(declared).pathname
+    } catch {
+        runtime.engine?.logger?.warn(
+            'MCP: ignoring auth.resource %j — not an absolute URL. Advertising the request origin + %s instead.',
+            declared, path)
+        return null
+    }
+    if (norm(pathname) === norm(path)) return declared
+    runtime.engine?.logger?.warn(
+        'MCP: ignoring auth.resource %j — it points at %j, not this endpoint (%j). RFC 9728 ' +
+        '`resource` must identify the MCP endpoint itself; a client compares it with the URL it ' +
+        'connected to and aborts authentication when they differ. Advertising the request origin ' +
+        '+ %s instead. If you meant the token audience, that is a different value — pass it to ' +
+        'the verifier, not here.',
+        declared, pathname, path, path)
+    return null
+}
+
+// OAuth 2.0 Protected Resource Metadata. Mounted only when the verifier
+// advertises an authorization server — a static token has nothing to
+// discover. Deliberately ungated: a client reads this BEFORE it has a
+// credential, so requiring one would be a locked door with the key inside.
+function mountProtectedResourceMetadata(app, path, verifier) {
+    if (!verifier?.authorizationServers?.length) return
+
+    // Checked once at mount, not per request: a bad value makes the endpoint
+    // unauthenticatable, so it belongs in the boot log rather than in some
+    // client's error message hours later.
+    const declaredResource = checkResource(verifier.resource, path)
+
+    const document = (req, res) => {
+        const origin = `${req.protocol}://${req.get('host')}`
+        res.json({
+            resource:                 declaredResource || `${origin}${path}`,
+            authorization_servers:    verifier.authorizationServers,
+            bearer_methods_supported: ['header'],
+            scopes_supported:         verifier.scopesSupported || [],
+        })
+    }
+
+    app.get(metadataPath(path), document)
+    // Also answer at the bare path for clients that probe it directly
+    // instead of following the challenge — first OAuth endpoint wins.
+    if (!claimedRoot.has(app)) {
+        claimedRoot.add(app)
+        app.get(PROTECTED_RESOURCE, document)
+    }
+
+    runtime.engine?.logger?.info(
+        'MCP OAuth discovery at %s (AS: %s)',
+        metadataPath(path), verifier.authorizationServers.join(', '))
+}
+
+// The 401 body tells a client it was refused; this header tells it what to
+// do about it. Without resource_metadata an OAuth-gated endpoint gives a
+// client no way to find the issuer.
+function challenge(req, res, verifier, path) {
+    if (verifier?.authorizationServers?.length) {
+        const origin = `${req.protocol}://${req.get('host')}`
+        res.set('WWW-Authenticate',
+            `Bearer resource_metadata="${origin}${metadataPath(path)}"`)
+        return
+    }
+    if (verifier?.challenge) return verifier.challenge(req, res)
+    if (verifier) res.set('WWW-Authenticate', 'Bearer')
+}
+
 function mountEndpoint(app, substrate, path, ep, endpointName) {
     const transports = new Map()
-    const expectedAuth = ep.token ? `Bearer ${ep.token}` : null
+
+    // ADR-0012: `auth` is a verifier (mikser-io-auth's oauth()/jwt(), or any
+    // { verify } object); `token` is the static-secret shorthand. Both land
+    // on the same seam, so everything below is credential-agnostic.
+    //
+    // They differ in ONE respect, deliberately: a plain `token` keeps
+    // mikser's documented "trusted local host" model — localhost reaches a
+    // token-gated endpoint without the token, because the token is there to
+    // keep the internet out, not the developer running the build. A real
+    // verifier does not get that bypass: if you went to the trouble of
+    // wiring OAuth onto an MCP endpoint, an unauthenticated loopback caller
+    // (another process on a shared box, an SSRF hop) is exactly the thing
+    // you were buying protection from. Same posture as WhiteBox.
+    const verifier      = resolveAuth(ep.auth ?? ep.token)
+    const trustLoopback = !ep.auth && !!ep.token
+
+    mountProtectedResourceMetadata(app, path, verifier)
 
     async function handle(req, res, body) {
-        // Auth rule (uniform across mikser plugins):
-        //   - Token presented and matches → allow (from anywhere)
-        //   - Token presented and doesn't match → 401
-        //   - No token presented → require loopback unless allowRemote
-        //
-        // This means an endpoint with a token can still be called from
-        // localhost without the token — the "trusted host" model. Same
-        // pattern Postgres trust-auth and Redis default use. If the host
-        // is compromised mikser's tools are the least of your worries.
-        const presented = req.headers.authorization
-        if (expectedAuth) {
-            if (presented && presented !== expectedAuth) {
-                runtime.engine?.logger?.debug(
-                    'MCP auth denied at %s: invalid token (ip=%s)', path, req.ip)
-                res.status(401).json({
-                    jsonrpc: '2.0',
-                    error: { code: -32001, message: 'Invalid MCP token' },
-                    id: null,
-                })
-                return
-            }
-            // No header presented falls through to the loopback check
-            // below — token-gated endpoints still accept loopback.
+        // The uniform rule now lives in the engine (mikser-io/src/auth.js).
+        // Only the DENIAL SHAPE is ours: MCP speaks JSON-RPC, so a bare
+        // { error } body would be unreadable to a client that is mid-
+        // handshake. That is the whole reason authorize() is exposed as a
+        // primitive alongside requireAuth()'s Express middleware.
+        let outcome
+        try {
+            outcome = await authorize(req, verifier, { allowRemote: ep.allowRemote, trustLoopback })
+        } catch (err) {
+            runtime.engine?.logger?.error(
+                'MCP auth verifier threw at %s: %s', path, err.message)
+            res.status(500).json({
+                jsonrpc: '2.0',
+                error: { code: -32001, message: 'Authentication failed' },
+                id: null,
+            })
+            return
         }
-        if (!presented || presented !== expectedAuth) {
-            if (!ep.allowRemote && !isLoopback(req.ip)) {
-                runtime.engine?.logger?.debug(
-                    'MCP auth denied at %s: non-loopback without token (ip=%s)', path, req.ip)
-                res.status(403).json({
-                    jsonrpc: '2.0',
-                    error: {
-                        code: -32001,
-                        message: expectedAuth
-                            ? 'Token required from non-loopback sources'
-                            : 'Endpoint accepts loopback connections only — configure a token or set allowRemote: true to enable remote access',
-                    },
-                    id: null,
-                })
-                return
-            }
+
+        if (!outcome.ok) {
+            runtime.engine?.logger?.debug(
+                'MCP auth denied at %s: %s (ip=%s)', path, outcome.reason, req.ip)
+            // RFC 9728 §5.1: a 401 from a protected resource points the
+            // client at its metadata, which is how an MCP client discovers
+            // WHERE to log in. Without this an OAuth-gated endpoint is just
+            // a closed door — the client has no way to find the issuer.
+            if (outcome.status === 401) challenge(req, res, verifier, path)
+            res.status(outcome.status).json({
+                jsonrpc: '2.0',
+                error: { code: -32001, message: outcome.error },
+                id: null,
+            })
+            return
         }
+        req.principal = outcome.principal
 
         const sessionId = req.headers['mcp-session-id']
         if (sessionId && transports.has(sessionId)) {
@@ -549,10 +664,12 @@ function mountEndpoint(app, substrate, path, ep, endpointName) {
     // REMOTE OPEN warning in the log. streaming:true — the MCP
     // Streamable HTTP transport sends SSE frames server→client, so a
     // facade must not buffer this route.
-    const reachability = ep.token ? 'token' : (ep.allowRemote ? 'public' : 'loopback')
-    const authLabel = ep.token
-        ? 'token'
-        : (ep.allowRemote ? 'public, REMOTE OPEN' : 'loopback-only')
+    const reachability = reachabilityOf(ep)
+    const authLabel = ep.auth
+        ? (verifier?.name ?? 'auth')
+        : ep.token
+            ? 'token'
+            : (ep.allowRemote ? 'public, REMOTE OPEN' : 'loopback-only')
     registerRoute({
         path,
         plugin:       'mcp',
