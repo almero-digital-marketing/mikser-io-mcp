@@ -36,6 +36,9 @@ import {
     resolveAuth,
     authorize,
     reachabilityOf,
+    explain,
+    buildReport,
+    requestReport,
 } from 'mikser-io'
 import packageInfo from 'mikser-io/package.json' with { type: 'json' }
 import previewPlugin from './preview.js'
@@ -808,6 +811,9 @@ export function mcp(options = {}) {
     // runtime.options.mcp by the time those run. The mcp plugin MUST
     // be FIRST in the user's plugins array for that contract to hold.
     runtime.options.mcp = createMcpSubstrate()
+    // mikser_build_report needs the cycle recorded, and recording is off
+    // unless a reader asks for it — see report.js requestReport.
+    requestReport()
     runtime.options.mcpPath = options.path ?? '/mcp'
 
     // Compose the MCP-UI surface in the same package — shell
@@ -895,6 +901,77 @@ export function mcp(options = {}) {
                     return ok({ id, count: entries.length, entries })
                 } catch (err) {
                     logger.error('MCP mikser_refs_outbound error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        // ── Diagnostics ────────────────────────────────────────────
+        //
+        // The three questions --explain, --json and --verify answer, over
+        // the transport an agent actually has. Everything built to make the
+        // engine legible landed on the CLI first, which meant it required a
+        // shell on the box: an agent could author a page and walk the ref
+        // graph, but could not ask why the engine did what it did — the
+        // question the whole area exists for.
+        //
+        // Read-only, all three. They return the same structured objects the
+        // CLI formats, so there is one implementation of each answer rather
+        // than a second one that drifts.
+
+        mcp.simpleTool(
+            'mikser_explain',
+            'Explain ONE entity: which layout claimed it and why, its destination, which inputs moved since it last rendered, every dependency edge with what it resolved to (and whether that target is now gone), whether its last render attempt threw, and a verdict on whether a build would re-render it. Accepts an id, a meta.href, or an id without its extension. This is the first thing to reach for when a page will not rebuild and nothing says why. Note it compares the CATALOG against the manifest: an edit not yet imported reports as `source differs from the catalog`.',
+            { reference: z.string().describe('Entity id, meta.href, or id without its extension.') },
+            async ({ reference }) => {
+                try {
+                    const report = await explain(reference)
+                    // found:false is an answer, not a failure — it carries a
+                    // hint about why nothing matched, which is the useful
+                    // half when an agent has guessed at an id.
+                    return ok(report)
+                } catch (err) {
+                    logger.error('MCP mikser_explain error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        mcp.simpleTool(
+            'mikser_build_report',
+            'What the LAST build cycle did, and why: entities rendered (each with a reason — inputs-changed, ref-changed, query-matched, retry-failed — and the detail behind it), skipped, rendered-but-byte-identical, renders that threw, and a count of entities gated at import. Use after a change to confirm what it actually invalidated, rather than inferring from the log. Empty until a cycle has run in this process.',
+            {},
+            async () => {
+                try {
+                    return ok(buildReport())
+                } catch (err) {
+                    logger.error('MCP mikser_build_report error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        mcp.simpleTool(
+            'mikser_verify',
+            'Check the output folder against what the manifest recorded: files missing, files whose bytes no longer match, snapshots with no recorded hash, and files on disk no snapshot claims. Answers "is what is deployed what mikser thinks it produced". Does not build or write anything.',
+            {},
+            async () => {
+                try {
+                    if (!runtime.manifest?.verify) {
+                        return fail('No manifest available — nothing to verify against')
+                    }
+                    const diff = await runtime.manifest.verify()
+                    const errors = diff.missing.length + diff.mismatched.length
+                    const warnings = diff.orphaned.length + diff.unverifiable.length
+                    return ok({
+                        // Same verdict vocabulary the CLI exits on, so a
+                        // caller does not have to re-derive it from counts.
+                        verdict: errors > 0 ? 'FAIL' : warnings > 0 ? 'WARN' : 'OK',
+                        snapshots: runtime.manifest.size?.() ?? null,
+                        ...diff,
+                    })
+                } catch (err) {
+                    logger.error('MCP mikser_verify error: %s', err.message)
                     return fail(err.message)
                 }
             },
