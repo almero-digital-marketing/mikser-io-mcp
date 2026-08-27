@@ -19,6 +19,7 @@
 // engine releases. See mikser-io's ADR-0006 for the rule (test #5,
 // release-cadence) that put it here.
 import { randomUUID } from 'node:crypto'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -34,6 +35,7 @@ import {
     useRenderer,
     useCollection,
     queryEntities,
+    findEntities,
     readEntity,
     registerRoute,
     resolveAuth,
@@ -42,7 +44,14 @@ import {
     explain,
     buildReport,
     requestReport,
+    nextCycleId,
+    whenCycleCompletes,
+    cycleHistory,
+    checksum as fileChecksumOf,
+    resolveOutputPath,
+    isTextEntity,
 } from 'mikser-io'
+import { readFile as readFileAsync, stat as statAsync, readdir as readdirAsync } from 'node:fs/promises'
 import packageInfo from 'mikser-io/package.json' with { type: 'json' }
 import previewPlugin from './preview.js'
 
@@ -427,12 +436,183 @@ export function createMcpSubstrate() {
                     outputFolder: runtime.options.outputFolder,
                     activeClients: substrate.activeServerCount(),
                     server: serverInfo(),
+                    // Whether this connection is authenticated and for how
+                    // much longer, so a long task can be sequenced rather
+                    // than discovering the answer mid-write.
+                    auth: authStatus(),
                 }, null, 2),
             }],
         }),
     )
 
     return substrate
+}
+
+
+
+
+
+// The authenticated principal, reachable from inside a tool handler.
+//
+// The MCP SDK calls a handler with the tool's ARGUMENTS — there is no
+// request object — so a per-request fact like "who is calling and until
+// when" has no other way through. Wrapping the request in an ALS keeps it
+// available without threading it into every tool signature, and without
+// stashing it on a session map that would then have to be reaped.
+const authContext = new AsyncLocalStorage()
+
+// What mikser_ping can say about the caller's credential.
+//
+// A JWT carries `exp`; a static bearer token has no expiry to report and
+// says so rather than implying an unlimited one. Getting this wrong in
+// either direction is expensive: a long task sequenced against a token that
+// dies mid-write, or a caller pausing to re-auth when it never had to.
+function authStatus() {
+    const principal = authContext.getStore()?.principal
+    if (!principal) {
+        return { authenticated: false, note: 'No credential on this request — loopback or an unauthenticated endpoint.' }
+    }
+    const exp = principal.claims?.exp
+    if (!exp) {
+        return {
+            authenticated: true,
+            subject: principal.subject ?? null,
+            capabilities: principal.capabilities ?? null,
+            expiresAt: null,
+            note: 'This credential carries no expiry (a static token). It stays valid until it is revoked or the config changes.',
+        }
+    }
+    const expiresAt = exp * 1000
+    const secondsRemaining = Math.max(0, Math.round((expiresAt - Date.now()) / 1000))
+    return {
+        authenticated: true,
+        subject: principal.subject ?? null,
+        capabilities: principal.capabilities ?? null,
+        expiresAt: new Date(expiresAt).toISOString(),
+        secondsRemaining,
+        note: secondsRemaining < 300
+            ? 'Expires in under five minutes — finish or re-authenticate before starting anything long.'
+            : 'Sequence long work to finish inside this window.',
+    }
+}
+
+// Output extensions worth returning as text. Deliberately a small allowlist
+// rather than a binary sniff: guessing wrong on a font or an image and
+// returning a utf8 read of it produces convincing garbage.
+const TEXT_OUTPUT_EXTENSIONS = new Set([
+    'html', 'htm', 'xml', 'json', 'txt', 'css', 'js', 'mjs', 'svg', 'md',
+    'csv', 'yml', 'yaml', 'rss', 'atom', 'webmanifest', 'map',
+])
+
+// Every leaf value under meta as [dottedPath, value], arrays included.
+// Same shape refs_inbound reports, so a hit here and a referrer there name
+// the same field.
+function* flattenMeta(node, prefix = '') {
+    if (node === null || node === undefined) return
+    if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i++) yield* flattenMeta(node[i], `${prefix}[${i}]`)
+        return
+    }
+    if (typeof node === 'object') {
+        for (const [key, value] of Object.entries(node)) {
+            yield* flattenMeta(value, prefix ? `${prefix}.${key}` : key)
+        }
+        return
+    }
+    yield [prefix, node]
+}
+
+// Enough text around the match to recognise it without returning the file.
+function snippetAround(text, query, regex, ignoreCase) {
+    const haystack = ignoreCase ? text.toLowerCase() : text
+    let at = -1
+    if (regex) {
+        const m = new RegExp(query, ignoreCase ? 'i' : '').exec(text)
+        at = m ? m.index : -1
+    } else {
+        at = haystack.indexOf(ignoreCase ? query.toLowerCase() : query)
+    }
+    if (at < 0) return text.slice(0, 120)
+    const start = Math.max(0, at - 60)
+    const end = Math.min(text.length, at + query.length + 60)
+    return (start > 0 ? '…' : '') + text.slice(start, end).replace(/\s+/g, ' ') + (end < text.length ? '…' : '')
+}
+
+// Drop what a caller almost never reads, and never touch `content`.
+//
+// Two things bloat a read: the same layout template inlined twice — once at
+// `layout.content` and again at `layouts[0].content`, byte for byte — and
+// the template body itself, which is what mikser_layouts_inspect is for.
+// The duplicate goes at every verbosity because a second identical copy is
+// not information; the body goes only at "compact".
+//
+// `content` is exempt at both settings. It is the source of a whole-file
+// rewrite, so trimming it would hand the caller a copy that looks writable
+// and silently deletes whatever was cut.
+function trimEntity(entity, verbosity) {
+    if (!entity || typeof entity !== 'object') return entity
+    const out = { ...entity }
+    if (Array.isArray(out.layouts) && out.layout) {
+        out.layouts = out.layouts.map(l => {
+            if (l && l.content !== undefined && l.content === out.layout.content) {
+                const { content, ...rest } = l
+                return { ...rest, contentSameAs: 'layout.content' }
+            }
+            return l
+        })
+    }
+    if (verbosity === 'compact') {
+        if (out.layout?.content !== undefined) {
+            out.layout = { ...out.layout, content: undefined, contentOmitted: 'verbosity=compact; use mikser_layouts_inspect' }
+        }
+        if (Array.isArray(out.layouts)) {
+            out.layouts = out.layouts.map(l => (l?.content === undefined ? l
+                : { ...l, content: undefined, contentOmitted: 'verbosity=compact' }))
+        }
+    }
+    return out
+}
+
+// The file's checksum, or null when it is not there yet. `checksum` throws
+// on a missing file; a caller asking "has this changed since I read it"
+// needs "it does not exist" as an answer rather than an exception.
+async function fileChecksum(uri) {
+    try {
+        return await fileChecksumOf(uri)
+    } catch {
+        return null
+    }
+}
+
+// Files beside this one that differ only by extension.
+//
+// The motivating case: an empty `index.md` sitting next to the real
+// `index.yml`, both rendering to /bg/index.html, one silently overwriting
+// the other. The destination is not known until the cycle renders, but the
+// COLLIDING SHAPE is visible at write time — same path, different suffix —
+// and saying so at the moment of the write is the only point where it is
+// cheap to fix.
+//
+// A heuristic, and named as one in the response: two files with the same
+// stem do not always collide (different layouts can send them elsewhere),
+// and a collision can also arise between unrelated paths. The build report
+// and mikser_verify carry the authoritative answer once a cycle has run.
+async function siblingsSharingDestination(folder, relativePath) {
+    const dir = path.dirname(path.join(folder, relativePath))
+    const base = path.basename(relativePath, path.extname(relativePath))
+    try {
+        const entries = await readdirAsync(dir, { withFileTypes: true })
+        return entries
+            .filter(e => e.isFile()
+                && path.basename(e.name, path.extname(e.name)) === base
+                && e.name !== path.basename(relativePath))
+            .map(e => ({
+                path: path.join(path.dirname(relativePath), e.name),
+                note: 'same name, different extension — may render to the same destination',
+            }))
+    } catch {
+        return []
+    }
 }
 
 // Derive a stable snapshot of "where outputs are visible to the user."
@@ -672,7 +852,11 @@ function mountEndpoint(app, substrate, path, ep, endpointName) {
 
         const sessionId = req.headers['mcp-session-id']
         if (sessionId && transports.has(sessionId)) {
-            return transports.get(sessionId).handleRequest(req, res, body)
+            // Inside the ALS so a tool handler can see who is calling — see
+            // authContext. The whole request runs in it, including the
+            // handler the SDK dispatches to.
+            return authContext.run({ principal: req.principal }, () =>
+                transports.get(sessionId).handleRequest(req, res, body))
         }
 
         // New session — server filtered for this endpoint's surface.
@@ -695,7 +879,8 @@ function mountEndpoint(app, substrate, path, ep, endpointName) {
             substrate.detach(server)
         }
         await server.connect(transport)
-        return transport.handleRequest(req, res, body)
+        return authContext.run({ principal: req.principal }, () =>
+            transport.handleRequest(req, res, body))
     }
 
     app.post(path, (req, res) => handle(req, res, req.body))
@@ -914,8 +1099,103 @@ export function mcp(options = {}) {
         const fail = (msg) => ({ isError: true, content: [{ type: 'text', text: msg }] })
 
         mcp.simpleTool(
+            'mikser_search',
+            'Find a string across the catalog in ONE call — "where does this appear?". Searches entity meta values and, when asked, the source files themselves, returning { id, collection, path, field, snippet } per hit.\n\n'
+            + 'This is the tool for locating content you can only describe by what it says: a menu label, a phone number, a sentence you were asked to change. Paging mikser_query_entities to find it means reading the whole catalog — most of which is fonts and image derivatives — and finding a SECOND copy of the same label somewhere else is then a matter of luck.\n\n'
+            + 'in: ["meta"] searches structured values (fast, indexed JSON walk). in: ["content"] reads source files from disk (slower, text formats only, binaries skipped). Default is both. `regex: true` treats `query` as a JavaScript regular expression.',
+            {
+                query:      z.string().describe('Text to find. A plain substring unless `regex` is true. Case-sensitive by default.'),
+                collection: z.string().optional().describe('Restrict to one collection (e.g. "documents"). Omit to search all.'),
+                in:         z.array(z.enum(['meta', 'content'])).optional().describe('Where to look: "meta" (entity fields) and/or "content" (source file text). Default both.'),
+                regex:      z.boolean().optional().describe('Treat `query` as a JavaScript regular expression rather than a literal substring.'),
+                ignoreCase: z.boolean().optional().describe('Case-insensitive matching. Default false.'),
+                limit:      z.number().int().positive().max(200).optional().describe('Maximum hits to return (default 50, max 200). The response says when it stopped early.'),
+            },
+            async ({ query, collection, in: where, regex, ignoreCase, limit = 50 }) => {
+                try {
+                    if (!query) return fail('query is required')
+                    const scopes = where?.length ? where : ['meta', 'content']
+                    let matcher
+                    try {
+                        matcher = regex
+                            ? new RegExp(query, ignoreCase ? 'i' : '')
+                            : { test: (v) => (ignoreCase ? String(v).toLowerCase().includes(query.toLowerCase()) : String(v).includes(query)) }
+                    } catch (err) {
+                        return fail(`invalid regex: ${err.message}`)
+                    }
+
+                    const hits = []
+                    let truncated = false
+                    const entities = await findEntities(collection ? { collection } : undefined)
+
+                    for (const entity of entities) {
+                        if (hits.length >= limit) { truncated = true; break }
+                        if (scopes.includes('meta') && entity.meta) {
+                            for (const [field, value] of flattenMeta(entity.meta)) {
+                                if (!matcher.test(value)) continue
+                                hits.push({ id: entity.id, collection: entity.collection ?? null, path: entity.uri ?? null,
+                                            where: 'meta', field, snippet: snippetAround(String(value), query, regex, ignoreCase) })
+                                break
+                            }
+                        }
+                        if (hits.length >= limit) { truncated = true; break }
+                        if (scopes.includes('content')) {
+                            // Text formats only. readEntityContent already owns
+                            // the text/binary decision, so a png is skipped here
+                            // for the same reason it is skipped everywhere else.
+                            if (!isTextEntity(entity)) continue
+                            const { content } = await readEntityContent(entity)
+                            if (typeof content !== 'string' || !matcher.test(content)) continue
+                            hits.push({ id: entity.id, collection: entity.collection ?? null, path: entity.uri ?? null,
+                                        where: 'content', field: null, snippet: snippetAround(content, query, regex, ignoreCase) })
+                        }
+                    }
+                    return ok({ query, scopes, count: hits.length, truncated, searched: entities.length, hits })
+                } catch (err) {
+                    logger.error('MCP mikser_search error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        mcp.simpleTool(
+            'mikser_read_output',
+            'Read the bytes currently ON DISK in the output folder for a destination — what is actually deployed, as opposed to what the catalog or the manifest says should be. Use it to confirm an edit shipped without leaving the toolset.\n\n'
+            + 'mikser_render does NOT answer this: it renders a transient entity through the pipeline and returns fresh bytes, which is a different question from "what is in the file right now".\n\n'
+            + 'Text output is returned inline. Binary output is not decoded — the response reports its size and media type instead, since a utf8 read of a png is garbage.',
+            {
+                destination: z.string().describe('Output-relative destination, as reported by mikser_explain or the build report (e.g. "/bg/index.html"). An absolute path recorded by a plugin writing outside the output folder also works.'),
+            },
+            async ({ destination }) => {
+                try {
+                    if (!destination) return fail('destination is required')
+                    const filePath = resolveOutputPath(destination)
+                    let info
+                    try {
+                        info = await statAsync(filePath)
+                    } catch {
+                        return ok({ destination, exists: false, path: filePath,
+                                    hint: 'Nothing is deployed at this destination. mikser_explain will say whether anything renders to it.' })
+                    }
+                    const ext = filePath.slice(filePath.lastIndexOf('.') + 1).toLowerCase()
+                    const text = TEXT_OUTPUT_EXTENSIONS.has(ext)
+                    if (!text) {
+                        return ok({ destination, exists: true, path: filePath, bytes: info.size, binary: true,
+                                    contentSkipped: `binary output (.${ext}) is not decoded; ${info.size} bytes on disk` })
+                    }
+                    const content = await readFileAsync(filePath, 'utf8')
+                    return ok({ destination, exists: true, path: filePath, bytes: info.size, binary: false, content })
+                } catch (err) {
+                    logger.error('MCP mikser_read_output error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        mcp.simpleTool(
             'mikser_refs_inbound',
-            'List entities that reference the given href. Returns every (entity id, field path) pair pointing at this target. Use for "what would break if I delete this?" or "show me everything that mentions /authors/dick." The query is exact-match against the canonical ref value as written in source $-keys.',
+            'List entities that reference the given href — "what breaks if I delete this?". Returns every (entity id, field path) pair pointing at the target, each tagged with `kind`: "ref" for a $-keyed reference field (the ones the engine invalidates on) or "href" for a plain string value anywhere under an entity\'s meta, including inside arrays such as a nav or footer item list. Exact match on the value as written in source.\n\n'
+            + 'The response always carries a `coverage` block naming what this does NOT see — body-text links and links a layout builds at render time — because a bare count: 0 otherwise reads as "nothing references this" when it means "nothing of the kind I look at". For body text, use mikser_search({ in: ["content"] }).',
             {
                 ref: z.string().describe('Reference value to look up. Match is exact on the source-file form (e.g. "/authors/dick"). Hrefs, not catalog ids.'),
             },
@@ -923,7 +1203,25 @@ export function mcp(options = {}) {
                 try {
                     if (!ref) return fail('ref is required')
                     const entries = runtime.refs.inboundFor(ref)
-                    return ok({ ref, count: entries.length, entries })
+                    return ok({
+                        ref,
+                        count: entries.length,
+                        entries,
+                        // What this answer does and does not cover, stated
+                        // every time. This tool answers "what breaks if I
+                        // delete this", and a bare count: 0 reads as "nothing"
+                        // when it may mean "nothing of the kind I look at" —
+                        // which is how two live pages linking to /about were
+                        // reported as zero referrers.
+                        coverage: {
+                            ref: '$-keyed reference fields, from the invalidation index',
+                            href: 'plain string values anywhere under an entity\'s meta, including inside arrays (nav/footer item lists)',
+                            notCovered: [
+                                'links written inside document BODY text (markdown/HTML), which are not entity meta — search for them with mikser_search({ in: ["content"] })',
+                                'links built at render time by a layout or sidecar rather than stored in meta',
+                            ],
+                        },
+                    })
                 } catch (err) {
                     logger.error('MCP mikser_refs_inbound error: %s', err.message)
                     return fail(err.message)
@@ -982,10 +1280,18 @@ export function mcp(options = {}) {
 
         mcp.simpleTool(
             'mikser_build_report',
-            'What the LAST build cycle did, and why: entities rendered (each with a reason — inputs-changed, ref-changed, query-matched, retry-failed — and the detail behind it), skipped, rendered-but-byte-identical, renders that threw, and a count of entities gated at import. Use after a change to confirm what it actually invalidated, rather than inferring from the log. Empty until a cycle has run in this process.',
-            {},
-            async () => {
+            'What a build cycle did, and why: entities rendered (each with a reason — inputs-changed, ref-changed, query-matched, retry-failed — and the detail behind it), skipped, rendered-but-byte-identical, renders that threw, warnings, and a count of entities gated at import. Each report carries the `cycleId` it describes and when that cycle started and finished.\n\n'
+            + 'Pass `cycles: N` for the last N FINISHED cycles, newest first. Two successive edits are two cycles, and without this the first one is gone by the time you ask — which makes "did my earlier change re-render those pages?" unanswerable from the tools. History keeps the last 10 cycles of this process.\n\n'
+            + 'Warnings include `destination-collision`, raised when two entities wrote the same destination in one cycle: one silently overwrote the other. Empty until a cycle has run in this process.',
+            {
+                cycles: z.number().int().positive().max(10).optional().describe('Return the last N finished cycles, newest first, instead of only the current one. Max 10 (the history limit).'),
+            },
+            async ({ cycles }) => {
                 try {
+                    if (cycles) {
+                        const history = cycleHistory(cycles)
+                        return ok({ cycles: history.length, reports: history })
+                    }
                     return ok(buildReport())
                 } catch (err) {
                     logger.error('MCP mikser_build_report error: %s', err.message)
@@ -1154,8 +1460,9 @@ export function mcp(options = {}) {
                 id: z.string().describe('Catalog id of the entity to read.'),
                 include: z.array(z.enum(['content'])).optional().describe('Optional list of extra fields to populate. Currently only "content" is supported: reads the file at entity.uri as utf8 and attaches it as .content. Binary formats get `contentSkipped` instead of garbage utf8.'),
                 expand: z.array(z.string()).optional().describe('Inline-expand referenced entities. Each entry is a dotted path through $-keyed reference fields. Use `*` for array iteration. Examples: ["author"], ["author.organization"], ["sections.*.image"]. Same caps as mikser_query_entities.'),
+                verbosity: z.enum(['full', 'compact']).optional().describe('"compact" drops the resolved layout template body, which is the bulk of a typical response and is rarely read — mikser_layouts_inspect returns it on purpose. `content` is NEVER trimmed at either setting. Default "full".'),
             },
-            async ({ id, include, expand }) => {
+            async ({ id, include, expand, verbosity = 'full' }) => {
                 try {
                     const entity = await readEntity({ id, expand })
                     if (entity && include?.includes('content')) {
@@ -1166,8 +1473,18 @@ export function mcp(options = {}) {
                         // shared across any consumer that wants the
                         // text/binary gate.
                         Object.assign(entity, await readEntityContent(entity))
+                        // `content` is the whole file, always. A caller's only
+                        // write mode is a whole-file rewrite, so a truncated or
+                        // transformed copy would be a silent data-loss machine:
+                        // it would look writable and delete whatever was cut.
+                        // Stated in the response, not just the description,
+                        // because that is what a caller can actually check.
+                        if (typeof entity.content === 'string') {
+                            entity.contentBytes = Buffer.byteLength(entity.content)
+                            entity.contentComplete = true
+                        }
                     }
-                    return ok(entity)
+                    return ok(trimEntity(entity, verbosity))
                 } catch (err) {
                     logger.error('MCP mikser_read_entity error: %s', err.message)
                     return fail(err.message)
@@ -1177,16 +1494,56 @@ export function mcp(options = {}) {
 
         mcp.simpleTool(
             'mikser_update_entity',
-            'Create or update a content file inside a mikser collection. The file is written to disk and the next lifecycle cycle picks it up. Use this to author new documents, layouts, or other content from AI.',
+            'Create or update a content file inside a mikser collection. Writes the WHOLE file — there is no partial-edit or patch mode, so send the complete intended contents. The file lands on disk and the next lifecycle cycle picks it up.\n\n'
+            + 'Pass `ifChecksum` with the checksum you got from mikser_read_entity to make the write conditional: if the file has changed since you read it the write is REFUSED and the response carries `currentChecksum`, so a blind whole-file rewrite cannot silently discard someone else\'s edit. Without it the write is unconditional.\n\n'
+            + 'The response returns the resulting `checksum` (pass it as the next `ifChecksum`), the `cycleId` your write will be picked up by, and `siblingDestinations` when another file could render to the same place (e.g. index.md beside index.yml — whichever renders last wins and the other output is discarded).\n\n'
+            + 'Pass `await: true` to block until that cycle finishes and get its build report back, so one call tells you what your edit invalidated instead of writing and guessing.',
             {
                 collection:   z.string().describe('Collection name (e.g. "documents", "layouts").'),
                 relativePath: z.string().describe('Path relative to the collection folder (e.g. "blog/2026-06-02-launch.md").'),
-                content:      z.string().optional().describe('File content to write. Frontmatter is parsed by the corresponding plugin.'),
+                content:      z.string().optional().describe('COMPLETE file content. This replaces the file; anything omitted is deleted. Frontmatter is parsed by the corresponding plugin.'),
+                ifChecksum:   z.string().optional().describe('Precondition: only write if the file\'s current checksum equals this. Use the `checksum` from mikser_read_entity. On mismatch the write is refused and `currentChecksum` is returned — re-read, re-apply your change, retry. Omit to write unconditionally.'),
+                await:        z.boolean().optional().describe('Block until the cycle that picks up this write completes, and return its build report as `report`. Slower, but answers "what did my edit change" in the same call.'),
             },
-            async ({ collection, relativePath, content = '' }) => {
+            async ({ collection, relativePath, content = '', ifChecksum, await: awaitCycle }) => {
                 try {
-                    await useCollection(runtime, collection).write(relativePath, content)
-                    return ok({ ok: true, collection, relativePath })
+                    const handle = useCollection(runtime, collection)
+                    const uri = path.join(handle.folder, relativePath)
+
+                    // Precondition, checked immediately before the write. This
+                    // is not a lock — a writer that lands between the check and
+                    // the write still wins — but it closes the window that
+                    // matters in practice: read, think, write back a whole file
+                    // built from a copy that is now stale.
+                    const before = await fileChecksum(uri)
+                    if (ifChecksum !== undefined && ifChecksum !== before) {
+                        return ok({
+                            ok: false,
+                            refused: 'checksum-mismatch',
+                            collection, relativePath,
+                            expectedChecksum: ifChecksum,
+                            currentChecksum: before,
+                            hint: before === null
+                                ? 'The file does not exist. Omit ifChecksum to create it.'
+                                : 'The file changed since you read it. Re-read it, re-apply your change to the new content, and retry with the checksum from that read.',
+                        })
+                    }
+
+                    const cycleId = nextCycleId()
+                    await handle.write(relativePath, content)
+                    const after = await fileChecksum(uri)
+
+                    const response = {
+                        ok: true, collection, relativePath,
+                        checksum: after,
+                        bytes: Buffer.byteLength(content),
+                        cycleId,
+                        siblingDestinations: await siblingsSharingDestination(handle.folder, relativePath),
+                    }
+                    if (awaitCycle) {
+                        response.report = await whenCycleCompletes(cycleId)
+                    }
+                    return ok(response)
                 } catch (err) {
                     logger.error('MCP mikser_update_entity error: %s', err.message)
                     return fail(err.message)
