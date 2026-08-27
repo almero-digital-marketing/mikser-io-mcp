@@ -46,19 +46,27 @@ import {
 import packageInfo from 'mikser-io/package.json' with { type: 'json' }
 import previewPlugin from './preview.js'
 
-// The mikser mark, inlined once at load as a data URI.
+// The mikser mark, offered two ways.
 //
 // MCP's Implementation carries `icons`, and a client with none falls back to
 // a letter avatar cut from whatever the user happened to name the connector.
-// A data URI rather than a served route because an icon URL has to resolve
-// for the CLIENT: a relative path means nothing to a remote one, and an
-// absolute path needs runtime.options.url, which is optional and frequently
-// unset on the private deployments this plugin is most used on. 446 bytes
-// costs less than the route, the reachability question, and the branch for
-// when the answer is no.
+//
+// `icons` is a LIST, and the two entries are not redundant. Some clients
+// refuse `data:` URIs for images outright — a content-security policy that
+// permits remote images and blocks inline ones is ordinary — and those need
+// an https URL. Others run somewhere the public internet is not reachable,
+// and for them the inline copy is the only one that renders. Listing the URL
+// first states the preference; the data URI means the answer is never
+// nothing.
+//
+// The URL points at the canonical artwork in the mikser-io repo rather than
+// at this deployment: an icon `src` has to resolve for the CLIENT, which is
+// generally nowhere near the server, and serving it locally would need
+// runtime.options.url — optional, and unset on most private installs.
 const ICON_SVG = readFileSync(
     path.join(path.dirname(fileURLToPath(import.meta.url)), 'assets', 'icon.svg'), 'utf8')
 const ICON_DATA_URI = `data:image/svg+xml;base64,${Buffer.from(ICON_SVG).toString('base64')}`
+const ICON_URL = 'https://raw.githubusercontent.com/almero-digital-marketing/mikser-io/main/mikser-mark.svg'
 
 // What this server calls itself in the initialize response. Exported so it
 // can be asserted on without reaching into the SDK's private state — the
@@ -70,7 +78,10 @@ export function serverImplementation() {
         // Without it a client displays 'mikser-io'.
         title:   'Mikser',
         version: packageInfo.version,
-        icons:   [{ src: ICON_DATA_URI, mimeType: 'image/svg+xml', sizes: ['any'] }],
+        icons: [
+            { src: ICON_URL,      mimeType: 'image/svg+xml', sizes: ['any'] },
+            { src: ICON_DATA_URI, mimeType: 'image/svg+xml', sizes: ['any'] },
+        ],
         websiteUrl: 'https://github.com/almero-digital-marketing/mikser-io',
     }
 }

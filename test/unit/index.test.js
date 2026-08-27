@@ -341,16 +341,25 @@ describe('server implementation', () => {
         assert.ok(impl.version)
     })
 
-    it('carries an icon that decodes to the mikser mark', async () => {
+    // Two entries, and neither is redundant: a client whose CSP blocks inline
+    // images needs the https one, and a client with no route to the public
+    // internet needs the inline one. A single entry fails one of them.
+    it('offers the mark as a remote URL first, then inline', async () => {
         const { serverImplementation } = await import('../../index.js')
-        const [icon] = serverImplementation().icons
-        assert.equal(icon.mimeType, 'image/svg+xml')
-        assert.deepEqual(icon.sizes, ['any'])
-        assert.match(icon.src, /^data:image\/svg\+xml;base64,/)
+        const icons = serverImplementation().icons
+        assert.equal(icons.length, 2)
+        assert.match(icons[0].src, /^https:\/\/raw\.githubusercontent\.com\/.*mikser-mark\.svg$/)
+        assert.match(icons[1].src, /^data:image\/svg\+xml;base64,/)
+        for (const icon of icons) {
+            assert.equal(icon.mimeType, 'image/svg+xml')
+            assert.deepEqual(icon.sizes, ['any'])
+        }
+    })
 
-        // A data URI rather than a path: the src has to resolve for the
-        // CLIENT, which may be nowhere near this deployment.
-        const svg = Buffer.from(icon.src.split(',')[1], 'base64').toString()
+    it('the inline copy decodes to the mikser mark', async () => {
+        const { serverImplementation } = await import('../../index.js')
+        const inline = serverImplementation().icons[1]
+        const svg = Buffer.from(inline.src.split(',')[1], 'base64').toString()
         assert.match(svg, /^<svg /)
         assert.match(svg, /mikser/)
     })
