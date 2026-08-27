@@ -19,6 +19,9 @@
 // engine releases. See mikser-io's ADR-0006 for the rule (test #5,
 // release-cadence) that put it here.
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { minimatch } from 'minimatch'
@@ -42,6 +45,35 @@ import {
 } from 'mikser-io'
 import packageInfo from 'mikser-io/package.json' with { type: 'json' }
 import previewPlugin from './preview.js'
+
+// The mikser mark, inlined once at load as a data URI.
+//
+// MCP's Implementation carries `icons`, and a client with none falls back to
+// a letter avatar cut from whatever the user happened to name the connector.
+// A data URI rather than a served route because an icon URL has to resolve
+// for the CLIENT: a relative path means nothing to a remote one, and an
+// absolute path needs runtime.options.url, which is optional and frequently
+// unset on the private deployments this plugin is most used on. 446 bytes
+// costs less than the route, the reachability question, and the branch for
+// when the answer is no.
+const ICON_SVG = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), 'assets', 'icon.svg'), 'utf8')
+const ICON_DATA_URI = `data:image/svg+xml;base64,${Buffer.from(ICON_SVG).toString('base64')}`
+
+// What this server calls itself in the initialize response. Exported so it
+// can be asserted on without reaching into the SDK's private state — the
+// values are ours; that they survive the SDK is what the live check covers.
+export function serverImplementation() {
+    return {
+        name:    'mikser-io',
+        // `name` is the programmatic identifier; `title` is what a UI shows.
+        // Without it a client displays 'mikser-io'.
+        title:   'Mikser',
+        version: packageInfo.version,
+        icons:   [{ src: ICON_DATA_URI, mimeType: 'image/svg+xml', sizes: ['any'] }],
+        websiteUrl: 'https://github.com/almero-digital-marketing/mikser-io',
+    }
+}
 
 // Pattern matcher for endpoint tools/resources filters. Accepts
 // '*', an array of patterns, or undefined (= allow all). Glob
@@ -197,7 +229,7 @@ export function createMcpSubstrate() {
         // category — that's the backward-compat default.
         createServer({ allowedTools, allowedResources, allowedPrompts } = {}) {
             const server = new McpServer(
-                { name: 'mikser-io', version: packageInfo.version },
+                serverImplementation(),
                 { capabilities: { tools: {}, resources: {}, logging: {} } },
             )
             const bound = bind(server, { allowedTools, allowedResources, allowedPrompts })

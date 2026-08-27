@@ -323,3 +323,35 @@ describe('endpoint filters (createServer with allowedTools / allowedResources)',
         assert.deepEqual(resourceUris.sort(), ['mikser://lifecycle', 'mikser://logs/recent'])
     })
 })
+
+// A client with no icon to show falls back to a letter avatar cut from
+// whatever the user named the connector — which is why a server that
+// advertises none looks unbranded however well it works. MCP's Implementation
+// carries `icons`, `title` and `websiteUrl`; this asserts we fill them.
+//
+// The values are asserted here rather than through the SDK: reading them back
+// off McpServer means touching its private state. That they survive into the
+// initialize response is a live check, not a unit one.
+describe('server implementation', () => {
+    it('advertises a display title distinct from the programmatic name', async () => {
+        const { serverImplementation } = await import('../../index.js')
+        const impl = serverImplementation()
+        assert.equal(impl.name, 'mikser-io')
+        assert.equal(impl.title, 'Mikser')
+        assert.ok(impl.version)
+    })
+
+    it('carries an icon that decodes to the mikser mark', async () => {
+        const { serverImplementation } = await import('../../index.js')
+        const [icon] = serverImplementation().icons
+        assert.equal(icon.mimeType, 'image/svg+xml')
+        assert.deepEqual(icon.sizes, ['any'])
+        assert.match(icon.src, /^data:image\/svg\+xml;base64,/)
+
+        // A data URI rather than a path: the src has to resolve for the
+        // CLIENT, which may be nowhere near this deployment.
+        const svg = Buffer.from(icon.src.split(',')[1], 'base64').toString()
+        assert.match(svg, /^<svg /)
+        assert.match(svg, /mikser/)
+    })
+})

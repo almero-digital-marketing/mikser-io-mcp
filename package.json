@@ -1,6 +1,6 @@
 {
   "name": "mikser-io-mcp",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "MCP (Model Context Protocol) substrate and tools for mikser-io. Extracted from core to iterate on its own release cadence.",
   "main": "index.js",
   "type": "module",
@@ -13,7 +13,8 @@
     "public",
     "scripts",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "assets"
   ],
   "scripts": {
     "test": "npm run test:unit",
