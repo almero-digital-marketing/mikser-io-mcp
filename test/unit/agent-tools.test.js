@@ -17,6 +17,8 @@ import { mcp } from '../../index.js'
 let wd
 let tools
 let inbound = []
+let snapshots = []
+let affected = []
 
 // Boot the plugin the way the engine does — factory, then the onLoaded
 // hooks — with a recorder attached to the substrate before the hooks run,
@@ -26,6 +28,8 @@ function bootPlugin() {
     const harness = createHarness({ options: { workingFolder: wd } })
     runtime.options.workingFolder   = wd
     runtime.options.documentsFolder = path.join(wd, 'documents')
+    runtime.options.stylesFolder    = path.join(wd, 'styles')
+    runtime.options.layoutsFolder   = path.join(wd, 'layouts')
     runtime.options.outputFolder    = path.join(wd, 'out')
     runtime.engine = { logger: harness.logger }
     runtime.refs = {
@@ -33,6 +37,12 @@ function bootPlugin() {
         outboundFor: () => [],
         allRefs:     () => [],
         size:        () => ({}),
+    }
+    runtime.manifest = {
+        snapshotsAt: (destination) => snapshots.filter(s => s.destination === destination),
+        snapshotsFor: (id) => snapshots.filter(s => s.id === id),
+        affectedBy: () => affected,
+        collisions: () => [],
     }
 
     mcp({})(harness.core)
@@ -75,6 +85,30 @@ before(async () => {
     await writeFile(path.join(wd, 'out/bg/index.html'), '<html><body>Начало</body></html>')
     await writeFile(path.join(wd, 'out/img/logo.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d]))
 
+    // A styles collection assembled into one bundle by a catalog query — the
+    // shape mikser_which exists for, where the built file names no source and
+    // the source names no destination.
+    await mkdir(path.join(wd, 'styles/tokens'), { recursive: true })
+    await mkdir(path.join(wd, 'styles/sections'), { recursive: true })
+    // Header comment first, then the rule. The comment mentions the selector,
+    // which is what the definition/mention split has to get right.
+    await writeFile(path.join(wd, 'styles/tokens/buttons.css'),
+        '/* Buttons\n   Spec source: uploads/spec.pdf — match exactly.\n'
+        + '   Variants: .btn--primary and .btn--secondary */\n'
+        + '.btn--primary {\n  background: black;\n}\n'
+        + '.btn--secondary {\n  background: white;\n}\n')
+    // A second file that scopes the same selector rather than defining it —
+    // a real second answer, which must be reported and ranked below.
+    await writeFile(path.join(wd, 'styles/sections/panel.css'),
+        '.panel .btn--secondary {\n  margin: 0;\n}\n')
+
+    // Built pages carrying the class at different weights: one component-heavy
+    // page and one that merely links. A list of equal-looking filenames hides
+    // exactly that difference.
+    await writeFile(path.join(wd, 'out/bg/heavy.html'),
+        '<a class="lmed-btn--secondary">a</a><a class="lmed-btn--secondary">b</a><a class="lmed-btn--secondary">c</a>')
+    await writeFile(path.join(wd, 'out/bg/light.html'), '<a class="lmed-btn--secondary">only one</a>')
+
     const { harness, recorder } = bootPlugin()
     // The catalog stub the search tool walks. `uri` points at the real
     // files, which is what makes the content scope readable.
@@ -92,6 +126,14 @@ before(async () => {
         { id: '/files/img/logo.png', collection: 'files',
           uri: path.join(wd, 'out/img/logo.png'),
           meta: { url: '/img/logo.png' } },
+        { id: '/styles/tokens/buttons.css', collection: 'styles',
+          uri: path.join(wd, 'styles/tokens/buttons.css'), meta: {} },
+        { id: '/styles/sections/panel.css', collection: 'styles',
+          uri: path.join(wd, 'styles/sections/panel.css'), meta: {} },
+        { id: '/layouts/styles.css.liquid', collection: 'layouts',
+          uri: path.join(wd, 'layouts/styles.css.liquid'), meta: {} },
+        { id: '/documents/bg/styles.yml', collection: 'documents',
+          uri: path.join(wd, 'documents/bg/styles.yml'), meta: { layout: 'styles' } },
     ]
     runtime.catalog.byId = new Map(entities.map(e => [e.id, e]))
     runtime.catalog.entities = entities
@@ -285,5 +327,206 @@ describe('mikser_refs_inbound', () => {
         assert.ok(res.coverage, 'expected a coverage block on every response')
         assert.ok(res.coverage.notCovered.some(s => /BODY text/.test(s)))
         assert.ok(res.coverage.notCovered.some(s => /render time/.test(s)))
+    })
+})
+
+describe('mikser_which — output back to source', () => {
+    it('says so plainly when no render claims the destination', async () => {
+        snapshots = []
+        const res = payload(await call('mikser_which', { destination: '/nothing/here.css' }))
+        assert.deepEqual(res.sources, [])
+        // A bare empty list reads as "nothing produced this", when the usual
+        // cause is a file COPIED there without a render snapshot.
+        assert.match(res.hint, /COPIED/)
+    })
+
+    it('resolves a recorded catalog query to the parts that went into the bundle', async () => {
+        snapshots = [{
+            id: '/documents/bg/styles.yml', destination: '/bg/styles/site.css',
+            refClosure: [
+                { kind: 'layout', target: '/layouts/styles.css.liquid', targetId: '/layouts/styles.css.liquid' },
+                { kind: 'query', filter: { collection: 'styles' } },
+            ],
+        }]
+        const res = payload(await call('mikser_which', { destination: '/bg/styles/site.css', selector: '.btn--secondary' }))
+        const buttons = res.sources.find(r => r.id === '/styles/tokens/buttons.css')
+        assert.ok(buttons, 'expected the query members to be resolved into sources')
+        assert.deepEqual(buttons.via, ['query {"collection":"styles"}'])
+    })
+
+    it('separates the rule that DEFINES a selector from a comment mentioning it', async () => {
+        snapshots = [{ id: '/documents/bg/styles.yml', destination: '/bg/styles/site.css',
+                       refClosure: [{ kind: 'query', filter: { collection: 'styles' } }] }]
+        const res = payload(await call('mikser_which', { destination: '/bg/styles/site.css', selector: '.btn--secondary' }))
+        const buttons = res.sources.find(r => r.id === '/styles/tokens/buttons.css')
+        // The fixture names the variant in its header comment and then
+        // implements it. Without the comment exclusion the header wins on
+        // line 2 and the rule looks like an afterthought.
+        assert.equal(buttons.definitions.length, 1)
+        assert.equal(buttons.definitions[0].rule, '.btn--secondary')
+        assert.ok(buttons.definitions[0].line > 2)
+        assert.equal(buttons.mentions, 1)
+    })
+
+    it('ranks a file that defines the selector above one that only scopes it', async () => {
+        snapshots = [{ id: '/documents/bg/styles.yml', destination: '/bg/styles/site.css',
+                       refClosure: [{ kind: 'query', filter: { collection: 'styles' } }] }]
+        const res = payload(await call('mikser_which', { destination: '/bg/styles/site.css', selector: '.btn--secondary' }))
+        assert.equal(res.sources[0].id, '/styles/tokens/buttons.css')
+        // Both define it exactly once, so count cannot break the tie — the
+        // base rule does. `.btn--secondary {}` is where the button lives;
+        // `.panel .btn--secondary {}` only overrides it in one container.
+        assert.equal(res.sources[0].definitions[0].exact, true)
+        const panel = res.sources.find(r => r.id === '/styles/sections/panel.css')
+        // The override is still reported — hiding it is how a fix lands in
+        // the wrong file.
+        assert.ok(panel)
+        assert.equal(panel.definitions[0].exact, false)
+        assert.equal(panel.definitions[0].rule, '.panel .btn--secondary')
+    })
+
+    it('lists what produced a destination when given no needle', async () => {
+        snapshots = [{ id: '/documents/bg/styles.yml', destination: '/bg/styles/site.css',
+                       refClosure: [{ kind: 'layout', target: '/layouts/styles.css.liquid', targetId: '/layouts/styles.css.liquid' }] }]
+        const res = payload(await call('mikser_which', { destination: '/bg/styles/site.css' }))
+        assert.equal(res.looking, null)
+        const ids = res.sources.map(r => r.id).sort()
+        assert.deepEqual(ids, ['/documents/bg/styles.yml', '/layouts/styles.css.liquid'])
+    })
+
+    it('flags a contested destination rather than silently unioning two renders', async () => {
+        snapshots = [
+            { id: '/documents/bg/a.yml', destination: '/bg/x.css', refClosure: [] },
+            { id: '/documents/bg/b.yml', destination: '/bg/x.css', refClosure: [] },
+        ]
+        const res = payload(await call('mikser_which', { destination: '/bg/x.css' }))
+        assert.equal(res.claimants.length, 2)
+        assert.match(res.contested, /More than one entity/)
+    })
+})
+
+describe('mikser_search in: ["output"]', () => {
+    it('counts occurrences per built file and ranks the heaviest first', async () => {
+        const res = payload(await call('mikser_search', { query: 'lmed-btn--secondary', in: ['output'] }))
+        assert.deepEqual(
+            res.hits.map(h => [h.destination, h.occurrences]),
+            [['/bg/heavy.html', 3], ['/bg/light.html', 1]])
+        assert.equal(res.hits[0].where, 'output')
+    })
+
+    it('does not search the catalog when only the output scope is asked for', async () => {
+        // The two answer different questions: a string can be in the output
+        // because a layout writes it, with no source entity containing it.
+        const res = payload(await call('mikser_search', { query: 'lmed-btn--secondary', in: ['output'] }))
+        assert.equal(res.searched, 0)
+        assert.ok(res.hits.every(h => h.where === 'output'))
+    })
+
+    it('is never implied by the default scopes', async () => {
+        const res = payload(await call('mikser_search', { query: 'lmed-btn--secondary' }))
+        assert.equal(res.hits.filter(h => h.where === 'output').length, 0)
+    })
+
+    it('skips binary output rather than decoding it', async () => {
+        const res = payload(await call('mikser_search', { query: 'PNG', in: ['output'] }))
+        assert.equal(res.hits.filter(h => h.destination.endsWith('.png')).length, 0)
+    })
+})
+
+describe('advisories — a marker that works without reading the file', () => {
+    it('reads a spec lock out of the header and names where it said so', async () => {
+        const res = payload(await call('mikser_read_entity', { id: '/styles/tokens/buttons.css', include: ['content'] }))
+        assert.deepEqual(res.advisories, [{
+            kind: 'spec-locked',
+            detail: 'uploads/spec.pdf — match exactly.',
+            via: 'header',
+            line: 2,
+        }])
+        assert.match(res.warning, /SPEC-LOCKED/)
+    })
+
+    it('echoes the lock on the way OUT, for a caller that never read the file', async () => {
+        const before = payload(await call('mikser_read_entity', { id: '/styles/tokens/buttons.css', include: ['content'] }))
+        const res = payload(await call('mikser_update_entity', {
+            id: '/styles/tokens/buttons.css', content: before.content, ifChecksum: before.checksum,
+        }))
+        assert.equal(res.ok, true)
+        assert.equal(res.advisories[0].kind, 'spec-locked')
+    })
+
+    it('says nothing about a file that carries no marker', async () => {
+        const res = payload(await call('mikser_read_entity', { id: '/styles/sections/panel.css', include: ['content'] }))
+        assert.equal(res.advisories, undefined)
+        assert.equal(res.warning, undefined)
+    })
+})
+
+describe('mikser_update_entity addressed by id', () => {
+    it('derives the collection and path from the entity, not from the id string', async () => {
+        // The id prefix is `idPrefix ?? "/" + collection` and the extension may
+        // have been stripped, so splitting on the first segment is a guess.
+        const res = payload(await call('mikser_update_entity', { id: '/styles/tokens/buttons.css', dryRun: true }))
+        assert.equal(res.collection, 'styles')
+        assert.equal(res.relativePath, 'tokens/buttons.css')
+    })
+
+    it('refuses an id the catalog does not know rather than guessing a path', async () => {
+        const res = await call('mikser_update_entity', { id: '/styles/not-a-file.css', content: 'x' })
+        assert.equal(res.isError, true)
+        assert.match(res.content[0].text, /No entity with id/)
+    })
+
+    it('refuses a collection that disagrees with the id', async () => {
+        const res = await call('mikser_update_entity', {
+            id: '/styles/tokens/buttons.css', collection: 'documents', content: 'x',
+        })
+        assert.equal(res.isError, true)
+        assert.match(res.content[0].text, /not documents/)
+    })
+
+    it('still accepts the collection + relativePath pair', async () => {
+        const res = payload(await call('mikser_update_entity', {
+            collection: 'documents', relativePath: 'bg/pair-still-works.yml', content: 'a: 1\n',
+        }))
+        assert.equal(res.ok, true)
+    })
+})
+
+describe('mikser_update_entity dryRun', () => {
+    it('writes nothing', async () => {
+        affected = []
+        const before = payload(await call('mikser_read_entity', { id: '/styles/tokens/buttons.css', include: ['content'] }))
+        await call('mikser_update_entity', { id: '/styles/tokens/buttons.css', content: 'wiped', dryRun: true })
+        const after = payload(await call('mikser_read_entity', { id: '/styles/tokens/buttons.css', include: ['content'] }))
+        assert.equal(after.content, before.content)
+    })
+
+    it('carries the same reason vocabulary the build report uses', async () => {
+        affected = [
+            { id: '/documents/bg/styles.yml', destination: '/bg/styles/site.css', reason: 'query-matched',
+              matched: { filter: { collection: 'styles' }, by: '/styles/tokens/buttons.css' } },
+            { id: '/documents/en/styles.yml', destination: '/en/styles/site.css', reason: 'query-matched',
+              matched: { filter: { collection: 'styles' }, by: '/styles/tokens/buttons.css' } },
+        ]
+        const res = payload(await call('mikser_update_entity', { id: '/styles/tokens/buttons.css', dryRun: true }))
+        assert.equal(res.wouldAffectCount, 2)
+        assert.deepEqual(res.wouldAffect.map(a => a.destination), ['/bg/styles/site.css', '/en/styles/site.css'])
+        // Provenance, not just a count — "which query, set off by what" is the
+        // half that makes the answer checkable.
+        assert.equal(res.wouldAffect[0].matched.by, '/styles/tokens/buttons.css')
+    })
+
+    it('reports the advisory before the bytes move, which is the point', async () => {
+        const res = payload(await call('mikser_update_entity', { id: '/styles/tokens/buttons.css', dryRun: true }))
+        assert.equal(res.advisories[0].kind, 'spec-locked')
+    })
+
+    it('says there is no blast radius for a file the catalog has never seen', async () => {
+        const res = payload(await call('mikser_update_entity', {
+            collection: 'documents', relativePath: 'bg/brand-new-file.yml', dryRun: true,
+        }))
+        assert.equal(res.exists, false)
+        assert.deepEqual(res.wouldAffect, [])
+        assert.match(res.note, /not in the catalog yet/)
     })
 })

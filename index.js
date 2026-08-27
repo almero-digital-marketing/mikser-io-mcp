@@ -522,6 +522,169 @@ function* flattenMeta(node, prefix = '') {
     yield [prefix, node]
 }
 
+// How many times the needle appears. A count, not a boolean, because "this
+// class is on nine pages" and "this class is on nine pages and seven times on
+// one of them" are different facts and the second one names the component.
+function countMatches(text, query, regex, ignoreCase) {
+    if (regex) {
+        const re = new RegExp(query, ignoreCase ? 'gi' : 'g')
+        let n = 0
+        // Guard the zero-width case: /a*/g on a non-matching position returns
+        // an empty match forever and never advances.
+        for (let m = re.exec(text); m; m = re.exec(text)) {
+            n++
+            if (m.index === re.lastIndex) re.lastIndex++
+        }
+        return n
+    }
+    const haystack = ignoreCase ? text.toLowerCase() : text
+    const needle = ignoreCase ? query.toLowerCase() : query
+    if (!needle) return 0
+    let n = 0
+    for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + needle.length)) n++
+    return n
+}
+
+// 1-based line of the first match, so a hit is somewhere to go rather than
+// something to grep for again.
+function lineOfFirstMatch(text, query, regex, ignoreCase) {
+    let at = -1
+    if (regex) {
+        const m = new RegExp(query, ignoreCase ? 'i' : '').exec(text)
+        at = m ? m.index : -1
+    } else {
+        const haystack = ignoreCase ? text.toLowerCase() : text
+        at = haystack.indexOf(ignoreCase ? query.toLowerCase() : query)
+    }
+    if (at < 0) return null
+    let line = 1
+    for (let i = 0; i < at; i++) if (text.charCodeAt(i) === 10) line++
+    return line
+}
+
+// Byte ranges covered by /* … */ comments, so a selector merely MENTIONED in
+// a comment is not reported as the rule that defines it. buttons.css documents
+// its own variants in its header; without this, the header wins on line 4 and
+// the rule on line 136 looks like an afterthought.
+function commentRanges(text) {
+    const ranges = []
+    for (let at = text.indexOf('/*'); at !== -1; at = text.indexOf('/*', at + 2)) {
+        const end = text.indexOf('*/', at + 2)
+        ranges.push([at, end === -1 ? text.length : end + 2])
+        if (end === -1) break
+        at = end
+    }
+    return ranges
+}
+
+const inRanges = (ranges, at) => ranges.some(([from, to]) => at >= from && at < to)
+
+// Where a selector is DEFINED versus merely mentioned.
+//
+// Definition test: from the match, the first structural character forward is
+// `{`. That is true for `.x {`, for `.x .y {`, for a comma-separated list, and
+// for a selector whose brace is on the next line — and false inside a
+// declaration value or a mention in prose. Comments are excluded outright.
+//
+// A heuristic, and the response says so: this is a string scan, not a CSS
+// parser, so a selector built by concatenation or emitted by a preprocessor is
+// not found. `occurrences` is reported alongside so a caller can see when the
+// two disagree.
+function findSelectorSites(text, needle) {
+    const comments = commentRanges(text)
+    const sites = []
+    let line = 1
+    let scanned = 0
+    for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + needle.length)) {
+        while (scanned < at) { if (text.charCodeAt(scanned) === 10) line++; scanned++ }
+        if (inRanges(comments, at)) { sites.push({ line, kind: 'comment' }); continue }
+        let kind = 'mention'
+        for (let i = at + needle.length; i < text.length; i++) {
+            const ch = text[i]
+            if (ch === '{') { kind = 'definition'; break }
+            if (ch === '}' || ch === ';') break
+        }
+        // The selector list this rule actually declares, so the caller can see
+        // whether the match is the whole selector or part of a longer one.
+        let rule = null
+        let exact = false
+        if (kind === 'definition') {
+            const open = text.indexOf('{', at)
+            // Where the selector prelude starts: just past the previous rule,
+            // comment or declaration. `lastIndexOf` returns -1 when there is
+            // none, and -1 plus an offset is a positive index that silently
+            // eats the first characters of the file — which turned
+            // `.panel .btn--secondary` into `panel .btn--secondary` and made
+            // the base-rule test miss.
+            const after = (needleStr, offset) => {
+                const found = text.lastIndexOf(needleStr, at)
+                return found === -1 ? 0 : found + offset
+            }
+            const from = Math.max(after('}', 1), after('*/', 2), after(';', 1))
+            rule = text.slice(from, open).trim().replace(/\s+/g, ' ')
+            // Does this rule define the selector ON ITS OWN, or only scoped
+            // inside something else? `.btn--secondary {}` is the base rule;
+            // `.panel .btn--secondary {}` is an override that applies in one
+            // container. Both are real answers and both are reported, but only
+            // the first is where "make this button transparent" belongs, and a
+            // caller that cannot tell them apart edits the wrong one.
+            exact = rule.split(',').some(part => part.trim() === needle)
+        }
+        sites.push({ line, kind, ...(rule ? { rule, exact } : {}) })
+    }
+    return sites
+}
+
+// The source entities that fed a render, each with HOW it got there.
+//
+// The refClosure is the engine's own record of what a render consumed, which
+// is why this is the authoritative direction rather than a guess: a bundle
+// built from `findEntities({ collection: 'styles' })` records that query, and
+// re-running it returns exactly the parts that went in.
+async function sourcesBehind(snapshot) {
+    const sources = new Map()
+    const add = (id, via) => {
+        if (!id) return
+        if (!sources.has(id)) sources.set(id, { id, via: [] })
+        if (!sources.get(id).via.includes(via)) sources.get(id).via.push(via)
+    }
+    add(snapshot.id, 'renders to this destination')
+    for (const entry of snapshot.refClosure ?? []) {
+        if (entry.kind === 'query') {
+            const label = `query ${entry.filter ? JSON.stringify(entry.filter) : '(unserializable — invalidates on any change)'}`
+            if (!entry.filter) continue
+            try {
+                for (const member of await findEntities(entry.filter)) add(member.id, label)
+            } catch { /* a recorded filter that no longer parses tells us nothing */ }
+            continue
+        }
+        for (const id of entry.targetIds ?? (entry.targetId ? [entry.targetId] : [])) {
+            add(id, entry.kind)
+        }
+        // An edge that resolved to nothing still names what it asked for.
+        if (!entry.targetId && !entry.targetIds?.length && entry.target) {
+            add(entry.target, `${entry.kind} (unresolved)`)
+        }
+    }
+    return [...sources.values()]
+}
+
+// Every file under the output folder, depth-first. A generator so a search
+// that hits its limit stops walking rather than materializing the tree.
+async function* walkOutputFiles(folder) {
+    let entries
+    try {
+        entries = await readdirAsync(folder, { withFileTypes: true })
+    } catch {
+        return
+    }
+    for (const entry of entries) {
+        const full = path.join(folder, entry.name)
+        if (entry.isDirectory()) yield* walkOutputFiles(full)
+        else if (entry.isFile()) yield full
+    }
+}
+
 // Enough text around the match to recognise it without returning the file.
 function snippetAround(text, query, regex, ignoreCase) {
     const haystack = ignoreCase ? text.toLowerCase() : text
@@ -613,6 +776,120 @@ async function siblingsSharingDestination(folder, relativePath) {
     } catch {
         return []
     }
+}
+
+// Files a caller must not edit blind, read from the bytes themselves.
+//
+// The motivating line is real: styles/tokens/buttons.css opens with
+// "Spec source: uploads/l-med-buttons2 for claude.pdf — match exactly." That
+// sentence is the difference between fixing a shared token and violating a
+// signed-off design, and it was discoverable only by reading far enough down
+// a comment nobody was asked to read. A marker that only works if you already
+// read the file is not a marker.
+//
+// Two kinds, kept apart because the instruction differs. `spec-locked` means
+// the bytes answer to a document outside the repo — change it and the site
+// stops matching something a human signed. `generated` means editing this file
+// at all is pointless, because the next build overwrites it.
+//
+// Declared either way:
+//   - `meta.specLocked` / `meta.generated`, for any format with frontmatter
+//     or YAML, which is the explicit form and wins.
+//   - a header line in the first HEADER_SCAN_LINES, for formats with no meta
+//     at all — .css, .js, plain .txt. That is most of the files this is for.
+const HEADER_SCAN_LINES = 40
+const HEADER_PATTERNS = [
+    { kind: 'spec-locked', re: /^\W*spec source:\s*(.+?)\s*$/i },
+    { kind: 'generated',   re: /^\W*(?:generated by|do not edit)\b:?\s*(.*?)\s*$/i },
+]
+
+// The catalog entity written from this file, when there is one. Used by the
+// write path, which is handed a folder-relative path rather than an id.
+async function findEntityAtUri(uri) {
+    if (!uri) return null
+    const matches = await findEntities({ uri })
+    return matches?.[0] ?? null
+}
+
+// The file's text, or null. Not an error path: a caller writing a .png has no
+// header to read and nothing has gone wrong.
+async function readIfText(uri) {
+    if (!isTextEntity({ uri })) return null
+    try {
+        return await readFileAsync(uri, 'utf8')
+    } catch {
+        return null
+    }
+}
+
+export function contentAdvisories(entity, content) {
+    const found = []
+    const push = (kind, detail, via, line) => {
+        if (found.some(a => a.kind === kind)) return
+        found.push({ kind, detail: detail || null, via, ...(line ? { line } : {}) })
+    }
+    // Explicit meta wins: someone wrote it down as data, on purpose.
+    if (entity?.meta?.specLocked) {
+        push('spec-locked', typeof entity.meta.specLocked === 'string' ? entity.meta.specLocked : null, 'meta.specLocked')
+    }
+    if (entity?.meta?.generated) {
+        push('generated', typeof entity.meta.generated === 'string' ? entity.meta.generated : null, 'meta.generated')
+    }
+    if (typeof content === 'string') {
+        const lines = content.split('\n', HEADER_SCAN_LINES)
+        for (let i = 0; i < lines.length; i++) {
+            for (const { kind, re } of HEADER_PATTERNS) {
+                const m = re.exec(lines[i])
+                if (m) push(kind, m[1], 'header', i + 1)
+            }
+        }
+    }
+    return found
+}
+
+// One line of prose for a response that has to be read, not parsed.
+export function advisoryWarning(advisories) {
+    if (!advisories?.length) return null
+    return advisories.map(a => a.kind === 'spec-locked'
+        ? `SPEC-LOCKED: ${a.detail ?? 'this file answers to an external specification'}`
+            + ' — changing it may break a signed-off design. Confirm against the spec before writing.'
+        : `GENERATED: ${a.detail ?? 'this file is produced by the build'}`
+            + ' — edit its source instead; the next build overwrites this.').join(' ')
+}
+
+// Resolve a catalog id to the (collection, relativePath) pair the write path
+// needs.
+//
+// Every other tool speaks ids. update_entity alone asked the caller to split
+// one into its parts, which a caller that just read or searched an entity
+// cannot reliably do: the id prefix is `idPrefix ?? '/' + collection` and the
+// extension may have been stripped, so splitting on the first segment is a
+// guess that is usually right and silently wrong for any source configured
+// either way.
+//
+// Taken from the entity instead — its `collection` and its `uri` relative to
+// that collection's folder, which is exactly how the id was built.
+async function locateById(id) {
+    const entity = await readEntity({ id })
+    if (!entity) {
+        return { error: `No entity with id ${id}. Ids come from mikser_query_entities / mikser_search; `
+            + 'to CREATE a file, pass collection + relativePath instead.' }
+    }
+    if (!entity.collection) return { error: `Entity ${id} has no collection, so its file location cannot be derived.` }
+    let folder
+    try {
+        folder = useCollection(runtime, entity.collection).folder
+    } catch (err) {
+        return { error: `Entity ${id} is in collection ${entity.collection}, which has no folder: ${err.message}` }
+    }
+    if (!entity.uri) {
+        return { error: `Entity ${id} has no uri — it is synthetic (emitted by a plugin, not read from a file) and has no file to rewrite.` }
+    }
+    const relativePath = path.relative(folder, entity.uri)
+    if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+        return { error: `Entity ${id} lives at ${entity.uri}, outside its collection folder ${folder}.` }
+    }
+    return { collection: entity.collection, relativePath }
 }
 
 // Derive a stable snapshot of "where outputs are visible to the user."
@@ -782,15 +1059,32 @@ function mountProtectedResourceMetadata(app, path, verifier) {
 // The 401 body tells a client it was refused; this header tells it what to
 // do about it. Without resource_metadata an OAuth-gated endpoint gives a
 // client no way to find the issuer.
-function challenge(req, res, verifier, path) {
+// RFC 6750 §3.1 error parameters, appended to whatever challenge the
+// surface builds.
+//
+// `error` is what a client's refresh logic reads. Without it an expired
+// access token and a request that never carried one produce byte-identical
+// responses, so a client cannot tell "exchange your refresh token" from
+// "send the human to a browser" — and does the second, mid-task. Omitted
+// entirely when nothing was presented, because that omission is itself the
+// signal for the sign-in case.
+function errorParams(outcome) {
+    if (!outcome?.code) return ''
+    let out = `, error="${outcome.code}"`
+    if (outcome.description) out += `, error_description="${outcome.description}"`
+    if (outcome.scope) out += `, scope="${outcome.scope}"`
+    return out
+}
+
+function challenge(req, res, verifier, path, outcome) {
     if (verifier?.authorizationServers?.length) {
         const origin = `${req.protocol}://${req.get('host')}`
         res.set('WWW-Authenticate',
-            `Bearer resource_metadata="${origin}${metadataPath(path)}"`)
+            `Bearer resource_metadata="${origin}${metadataPath(path)}"${errorParams(outcome)}`)
         return
     }
-    if (verifier?.challenge) return verifier.challenge(req, res)
-    if (verifier) res.set('WWW-Authenticate', 'Bearer')
+    if (verifier?.challenge) return verifier.challenge(req, res, outcome)
+    if (verifier) res.set('WWW-Authenticate', `Bearer${errorParams(outcome)}`.replace(/^Bearer, /, 'Bearer '))
 }
 
 function mountEndpoint(app, substrate, path, ep, endpointName) {
@@ -840,7 +1134,14 @@ function mountEndpoint(app, substrate, path, ep, endpointName) {
             // client at its metadata, which is how an MCP client discovers
             // WHERE to log in. Without this an OAuth-gated endpoint is just
             // a closed door — the client has no way to find the issuer.
-            if (outcome.status === 401) challenge(req, res, verifier, path)
+            //
+            // 403 gets one too: insufficient_scope lives there, and a client
+            // reading the header only on 401 is the client that cannot tell
+            // "your token expired" from "your token is not allowed to do
+            // this" — the first is silently fixable, the second never is.
+            if (outcome.status === 401 || outcome.status === 403) {
+                challenge(req, res, verifier, path, outcome)
+            }
             res.status(outcome.status).json({
                 jsonrpc: '2.0',
                 error: { code: -32001, message: outcome.error },
@@ -1102,11 +1403,12 @@ export function mcp(options = {}) {
             'mikser_search',
             'Find a string across the catalog in ONE call — "where does this appear?". Searches entity meta values and, when asked, the source files themselves, returning { id, collection, path, field, snippet } per hit.\n\n'
             + 'This is the tool for locating content you can only describe by what it says: a menu label, a phone number, a sentence you were asked to change. Paging mikser_query_entities to find it means reading the whole catalog — most of which is fonts and image derivatives — and finding a SECOND copy of the same label somewhere else is then a matter of luck.\n\n'
-            + 'in: ["meta"] searches structured values (fast, indexed JSON walk). in: ["content"] reads source files from disk (slower, text formats only, binaries skipped). Default is both. `regex: true` treats `query` as a JavaScript regular expression.',
+            + 'in: ["meta"] searches structured values (fast, indexed JSON walk). in: ["content"] reads source files from disk (slower, text formats only, binaries skipped). Default is both. `regex: true` treats `query` as a JavaScript regular expression.\n\n'
+            + 'in: ["output"] searches the BUILT files instead of the catalog, and reports `occurrences` per destination. That is the blast-radius question — "which shipped pages carry this class, and how heavily" — which is what you want before editing anything shared. The two scopes answer different questions and neither implies the other: a string can be in the output because a layout writes it, with no source entity containing it anywhere.',
             {
                 query:      z.string().describe('Text to find. A plain substring unless `regex` is true. Case-sensitive by default.'),
                 collection: z.string().optional().describe('Restrict to one collection (e.g. "documents"). Omit to search all.'),
-                in:         z.array(z.enum(['meta', 'content'])).optional().describe('Where to look: "meta" (entity fields) and/or "content" (source file text). Default both.'),
+                in:         z.array(z.enum(['meta', 'content', 'output'])).optional().describe('Where to look: "meta" (entity fields), "content" (source file text), "output" (the BUILT files in the output folder). Default is meta + content; "output" is never implied because it answers a different question.'),
                 regex:      z.boolean().optional().describe('Treat `query` as a JavaScript regular expression rather than a literal substring.'),
                 ignoreCase: z.boolean().optional().describe('Case-insensitive matching. Default false.'),
                 limit:      z.number().int().positive().max(200).optional().describe('Maximum hits to return (default 50, max 200). The response says when it stopped early.'),
@@ -1126,7 +1428,38 @@ export function mcp(options = {}) {
 
                     const hits = []
                     let truncated = false
-                    const entities = await findEntities(collection ? { collection } : undefined)
+
+                    // The output scope walks the deployed folder, not the
+                    // catalog, so it runs on its own and skips the entity loop
+                    // entirely. Counting is the point here rather than
+                    // first-match: seven occurrences on one page and one on
+                    // nine others is the shape of a shared component, and a
+                    // list of nine equal-looking filenames hides it.
+                    if (scopes.includes('output')) {
+                        const outputFolder = runtime.options?.outputFolder
+                        if (!outputFolder) return fail('No output folder configured, so there is no built output to search.')
+                        for await (const file of walkOutputFiles(outputFolder)) {
+                            if (hits.length >= limit) { truncated = true; break }
+                            const ext = file.slice(file.lastIndexOf('.') + 1).toLowerCase()
+                            if (!TEXT_OUTPUT_EXTENSIONS.has(ext)) continue
+                            let text
+                            try { text = await readFileAsync(file, 'utf8') } catch { continue }
+                            const occurrences = countMatches(text, query, regex, ignoreCase)
+                            if (!occurrences) continue
+                            hits.push({
+                                destination: '/' + path.relative(outputFolder, file).split(path.sep).join('/'),
+                                where: 'output',
+                                occurrences,
+                                snippet: snippetAround(text, query, regex, ignoreCase),
+                            })
+                        }
+                        hits.sort((a, b) => b.occurrences - a.occurrences || a.destination.localeCompare(b.destination))
+                    }
+
+                    const searchesCatalog = scopes.some(scope => scope !== 'output')
+                    const entities = searchesCatalog
+                        ? await findEntities(collection ? { collection } : undefined)
+                        : []
 
                     for (const entity of entities) {
                         if (hits.length >= limit) { truncated = true; break }
@@ -1147,12 +1480,125 @@ export function mcp(options = {}) {
                             const { content } = await readEntityContent(entity)
                             if (typeof content !== 'string' || !matcher.test(content)) continue
                             hits.push({ id: entity.id, collection: entity.collection ?? null, path: entity.uri ?? null,
-                                        where: 'content', field: null, snippet: snippetAround(content, query, regex, ignoreCase) })
+                                        where: 'content', field: null,
+                                        occurrences: countMatches(content, query, regex, ignoreCase),
+                                        line: lineOfFirstMatch(content, query, regex, ignoreCase),
+                                        snippet: snippetAround(content, query, regex, ignoreCase) })
                         }
                     }
                     return ok({ query, scopes, count: hits.length, truncated, searched: entities.length, hits })
                 } catch (err) {
                     logger.error('MCP mikser_search error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+        )
+
+        mcp.simpleTool(
+            'mikser_which',
+            'Reverse lookup, output back to source: "which source file produced this, and where in it?". Give it a built destination and, optionally, a CSS selector or a string to locate inside the sources that fed it.\n\n'
+            + 'This is the question an agent editing an existing site asks first and could not previously ask at all. Finding which file paints a button meant opening the live site in a browser, reading the element\'s class out of the DOM, and guessing at filenames — none of which needs to leave the toolset.\n\n'
+            + 'The answer comes from the engine\'s own refClosure — the record of what each render consumed — so a bundle assembled from a catalog query resolves to the actual parts that went into it, each tagged with HOW it got there. With a `selector`, hits are split into definitions (the rule that sets the properties) and mentions, and comments are excluded, so the header documenting a variant does not outrank the rule implementing it.\n\n'
+            + 'Omit both `selector` and `text` to just list what produced the destination.',
+            {
+                destination: z.string().describe('Output-relative destination, as reported by mikser_search({ in: ["output"] }), mikser_explain or the build report (e.g. "/bg/styles/site.css").'),
+                selector:    z.string().optional().describe('A CSS selector or class to locate (e.g. ".lmed-btn--secondary"). Hits are classified as definitions vs mentions and ranked definitions first.'),
+                text:        z.string().optional().describe('A plain string to locate in the sources, for non-CSS output. Matched literally, case-sensitive.'),
+                limit:       z.number().int().positive().max(200).optional().describe('Maximum source files to report (default 50).'),
+            },
+            async ({ destination, selector, text, limit = 50 }) => {
+                try {
+                    if (!destination) return fail('destination is required')
+                    if (!runtime.manifest?.snapshotsAt) {
+                        return fail('No manifest available — nothing has been rendered yet.')
+                    }
+                    const snapshots = runtime.manifest.snapshotsAt(destination)
+                    if (!snapshots.length) {
+                        return ok({
+                            destination, sources: [],
+                            hint: 'No render claims this destination. It may be a file COPIED there (the files/shares/data plugins write '
+                                + 'without a render snapshot), or the path may be wrong — mikser_search({ in: ["output"] }) lists what is '
+                                + 'actually on disk, and mikser_read_output confirms one path.',
+                        })
+                    }
+
+                    const needle = selector ?? text
+                    const results = []
+                    let searched = 0
+                    for (const snapshot of snapshots) {
+                        for (const source of await sourcesBehind(snapshot)) {
+                            if (results.length >= limit) break
+                            const entity = await readEntity({ id: source.id })
+                            const row = {
+                                id: source.id,
+                                path: entity?.uri ?? null,
+                                via: source.via,
+                                claimedBy: snapshots.length > 1 ? snapshot.id : undefined,
+                            }
+                            if (!needle) { results.push(row); continue }
+                            if (!entity || !isTextEntity(entity)) continue
+                            const { content } = await readEntityContent(entity)
+                            if (typeof content !== 'string') continue
+                            searched++
+                            if (selector) {
+                                const sites = findSelectorSites(content, selector)
+                                const definitions = sites.filter(site => site.kind === 'definition')
+                                if (!sites.length) continue
+                                results.push({
+                                    ...row,
+                                    definitions,
+                                    mentions: sites.filter(site => site.kind !== 'definition').length,
+                                    occurrences: sites.length,
+                                })
+                            } else {
+                                const occurrences = countMatches(content, text, false, false)
+                                if (!occurrences) continue
+                                results.push({
+                                    ...row, occurrences,
+                                    line: lineOfFirstMatch(content, text, false, false),
+                                    snippet: snippetAround(content, text, false, false),
+                                })
+                            }
+                        }
+                    }
+                    // A file that DEFINES the selector is the answer; one that
+                    // merely mentions it is context. Ranked rather than filtered
+                    // because an override in a section stylesheet is a real
+                    // second answer, and hiding it is how a fix gets applied in
+                    // the wrong place.
+                    if (selector) {
+                        // A file holding the BASE rule outranks one that only
+                        // scopes the selector, however many times it does so.
+                        // Ranking by definition count alone put a section
+                        // stylesheet with one scoped override above the token
+                        // file that defines the button, and line number within
+                        // a file says nothing about which file is authoritative.
+                        const baseRules = (r) => r.definitions?.filter(d => d.exact).length ?? 0
+                        results.sort((a, b) =>
+                            (baseRules(b) > 0) - (baseRules(a) > 0)
+                            || baseRules(b) - baseRules(a)
+                            || (b.definitions?.length ?? 0) - (a.definitions?.length ?? 0))
+                    } else if (text) {
+                        results.sort((a, b) => (b.occurrences ?? 0) - (a.occurrences ?? 0))
+                    }
+                    return ok({
+                        destination,
+                        claimants: snapshots.map(snap => snap.id),
+                        ...(snapshots.length > 1
+                            ? { contested: 'More than one entity renders to this destination — see mikser_explain. The sources below are the union of what all of them consumed.' }
+                            : {}),
+                        looking: selector ? { selector } : text ? { text } : null,
+                        searched,
+                        count: results.length,
+                        sources: results,
+                        coverage: needle
+                            ? 'String scan over the source files the refClosure names, so a selector composed at render time (built by '
+                              + 'concatenation, or emitted by a preprocessor) is not found. `definitions` is a heuristic: the first '
+                              + 'structural character after the match is `{`. Comments are excluded.'
+                            : 'Every source the engine recorded for this render, including its layout, partials, $-refs and the members of any recorded catalog query.',
+                    })
+                } catch (err) {
+                    logger.error('MCP mikser_which error: %s', err.message)
                     return fail(err.message)
                 }
             },
@@ -1484,6 +1930,22 @@ export function mcp(options = {}) {
                             entity.contentComplete = true
                         }
                     }
+                    // Structured, not left in a comment for a reader to
+                    // happen upon. A file governed by an external spec, or
+                    // generated by the build, is one a caller must not edit
+                    // blind — and a marker that only works if you already read
+                    // far enough down the file is not a marker.
+                    //
+                    // Reported whether or not `content` was requested: the meta
+                    // form needs no bytes, and the header form reads them here
+                    // rather than making the caller ask twice.
+                    const advisories = entity ? contentAdvisories(
+                        entity,
+                        typeof entity.content === 'string' ? entity.content : await readIfText(entity.uri)) : []
+                    if (advisories.length) {
+                        entity.advisories = advisories
+                        entity.warning = advisoryWarning(advisories)
+                    }
                     return ok(trimEntity(entity, verbosity))
                 } catch (err) {
                     logger.error('MCP mikser_read_entity error: %s', err.message)
@@ -1499,16 +1961,66 @@ export function mcp(options = {}) {
             + 'The response returns the resulting `checksum` (pass it as the next `ifChecksum`), the `cycleId` your write will be picked up by, and `siblingDestinations` when another file could render to the same place (e.g. index.md beside index.yml — whichever renders last wins and the other output is discarded).\n\n'
             + 'Pass `await: true` to block until that cycle finishes and get its build report back, so one call tells you what your edit invalidated instead of writing and guessing.',
             {
-                collection:   z.string().describe('Collection name (e.g. "documents", "layouts").'),
-                relativePath: z.string().describe('Path relative to the collection folder (e.g. "blog/2026-06-02-launch.md").'),
+                id:           z.string().optional().describe('Catalog id of an EXISTING entity (e.g. "/styles/tokens/buttons.css"), as returned by every other tool. Alternative to collection + relativePath; the file location is derived from the entity. To create a new file, pass the pair instead.'),
+                collection:   z.string().optional().describe('Collection name (e.g. "documents", "layouts"). Required unless `id` is given.'),
+                relativePath: z.string().optional().describe('Path relative to the collection folder (e.g. "blog/2026-06-02-launch.md"). Required unless `id` is given.'),
                 content:      z.string().optional().describe('COMPLETE file content. This replaces the file; anything omitted is deleted. Frontmatter is parsed by the corresponding plugin.'),
                 ifChecksum:   z.string().optional().describe('Precondition: only write if the file\'s current checksum equals this. Use the `checksum` from mikser_read_entity. On mismatch the write is refused and `currentChecksum` is returned — re-read, re-apply your change, retry. Omit to write unconditionally.'),
                 await:        z.boolean().optional().describe('Block until the cycle that picks up this write completes, and return its build report as `report`. Slower, but answers "what did my edit change" in the same call.'),
+                dryRun:       z.boolean().optional().describe('Write NOTHING. Returns `wouldAffect` — every destination that would re-render, each with the same reason vocabulary the build report uses — plus any advisory on the file and any destination collision already standing at those outputs. Use before touching anything shared.'),
             },
-            async ({ collection, relativePath, content = '', ifChecksum, await: awaitCycle }) => {
+            async ({ id, collection, relativePath, content = '', ifChecksum, await: awaitCycle, dryRun }) => {
                 try {
+                    if (id) {
+                        const located = await locateById(id)
+                        if (located.error) return fail(located.error)
+                        // An explicit pair still wins if a caller passes both,
+                        // but disagreeing with the id is a mistake worth
+                        // refusing rather than silently resolving one way.
+                        if (collection && collection !== located.collection) {
+                            return fail(`id ${id} is in collection ${located.collection}, not ${collection}. Pass one or the other.`)
+                        }
+                        collection ??= located.collection
+                        relativePath ??= located.relativePath
+                    }
+                    if (!collection || !relativePath) {
+                        return fail('Pass either `id` (for an existing entity) or both `collection` and `relativePath`.')
+                    }
                     const handle = useCollection(runtime, collection)
                     const uri = path.join(handle.folder, relativePath)
+
+                    // Everything a caller should know BEFORE the bytes move.
+                    // Computed for the dry run and for the real write alike, so
+                    // the preview and the thing it previews cannot disagree.
+                    const existing = id ? await readEntity({ id }) : await findEntityAtUri(uri)
+                    const advisories = contentAdvisories(existing, await readIfText(uri))
+
+                    if (dryRun) {
+                        const wouldAffect = existing?.id
+                            ? (runtime.manifest?.affectedBy?.(existing) ?? [])
+                            : []
+                        const touched = new Set(wouldAffect.map(a => a.destination))
+                        return ok({
+                            ok: true, dryRun: true, collection, relativePath,
+                            id: existing?.id ?? null,
+                            exists: existing != null,
+                            currentChecksum: await fileChecksum(uri),
+                            advisories,
+                            warning: advisoryWarning(advisories),
+                            wouldAffect,
+                            wouldAffectCount: wouldAffect.length,
+                            siblingDestinations: await siblingsSharingDestination(handle.folder, relativePath),
+                            // Collisions ALREADY standing at the outputs this
+                            // write would touch. A write cannot be blamed for
+                            // them, but re-rendering into one is how the wrong
+                            // half of a contested destination wins.
+                            collisionsAtAffected: (runtime.manifest?.collisions?.() ?? [])
+                                .filter(c => touched.has(c.destination)),
+                            note: existing?.id
+                                ? 'Destinations are computed with the engine\'s own skip rule, so they match what a real cycle would do — EXCEPT for changes to the entity\'s own frontmatter, which is parsed during import and can move its destination.'
+                                : 'This file is not in the catalog yet, so nothing depends on it and there is no blast radius to report.',
+                        })
+                    }
 
                     // Precondition, checked immediately before the write. This
                     // is not a lock — a writer that lands between the check and
@@ -1539,6 +2051,14 @@ export function mcp(options = {}) {
                         bytes: Buffer.byteLength(content),
                         cycleId,
                         siblingDestinations: await siblingsSharingDestination(handle.folder, relativePath),
+                    }
+                    // Echoed on the way out, not only on read. A caller that
+                    // never read the file — or read past the header — is
+                    // exactly the one that needs telling, and telling it after
+                    // the write still names what to check before the deploy.
+                    if (advisories.length) {
+                        response.advisories = advisories
+                        response.warning = advisoryWarning(advisories)
                     }
                     if (awaitCycle) {
                         response.report = await whenCycleCompletes(cycleId)
