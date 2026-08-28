@@ -51,6 +51,8 @@ import {
     resolveOutputPath,
     isTextEntity,
     useProvenance,
+    sourcesBehind,
+    sourcesOf,
     registerTool as coreRegisterTool,
     toolNames as coreToolNames,
     toolSchema as coreToolSchema,
@@ -709,50 +711,16 @@ async function metaHits(entity, needle) {
 // the two cannot give different answers to the same question. Returns an empty
 // list rather than guessing when the render composed the value itself.
 async function attributeOutput(destination, needle) {
-    const snapshots = runtime.manifest?.snapshotsAt?.(destination) ?? []
     const out = []
-    for (const snapshot of snapshots) {
-        for (const source of await sourcesBehind(snapshot)) {
-            const entity = await readEntity({ id: source.id })
-            const fields = await metaHits(entity, needle)
-            if (fields.length) out.push({ id: source.id, via: source.via, fields })
-        }
+    // sourcesOf is the engine's own union across every entity claiming the
+    // destination, so a contested one attributes through both rather than
+    // through whichever snapshot came back first.
+    for (const source of await sourcesOf(destination)) {
+        const entity = await readEntity({ id: source.id })
+        const fields = await metaHits(entity, needle)
+        if (fields.length) out.push({ id: source.id, via: source.via, fields })
     }
     return out
-}
-
-// The source entities that fed a render, each with HOW it got there.
-//
-// The refClosure is the engine's own record of what a render consumed, which
-// is why this is the authoritative direction rather than a guess: a bundle
-// built from `findEntities({ collection: 'styles' })` records that query, and
-// re-running it returns exactly the parts that went in.
-async function sourcesBehind(snapshot) {
-    const sources = new Map()
-    const add = (id, via) => {
-        if (!id) return
-        if (!sources.has(id)) sources.set(id, { id, via: [] })
-        if (!sources.get(id).via.includes(via)) sources.get(id).via.push(via)
-    }
-    add(snapshot.id, 'renders to this destination')
-    for (const entry of snapshot.refClosure ?? []) {
-        if (entry.kind === 'query') {
-            const label = `query ${entry.filter ? JSON.stringify(entry.filter) : '(unserializable — invalidates on any change)'}`
-            if (!entry.filter) continue
-            try {
-                for (const member of await findEntities(entry.filter)) add(member.id, label)
-            } catch { /* a recorded filter that no longer parses tells us nothing */ }
-            continue
-        }
-        for (const id of entry.targetIds ?? (entry.targetId ? [entry.targetId] : [])) {
-            add(id, entry.kind)
-        }
-        // An edge that resolved to nothing still names what it asked for.
-        if (!entry.targetId && !entry.targetIds?.length && entry.target) {
-            add(entry.target, `${entry.kind} (unresolved)`)
-        }
-    }
-    return [...sources.values()]
 }
 
 // Every file under the output folder, depth-first. A generator so a search
