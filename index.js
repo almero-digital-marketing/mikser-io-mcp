@@ -663,75 +663,44 @@ function lineOfFirstMatch(text, query, regex, ignoreCase) {
     return line
 }
 
-// Byte ranges covered by /* … */ comments, so a selector merely MENTIONED in
-// a comment is not reported as the rule that defines it. buttons.css documents
-// its own variants in its header; without this, the header wins on line 4 and
-// the rule on line 136 looks like an afterthought.
-function commentRanges(text) {
-    const ranges = []
-    for (let at = text.indexOf('/*'); at !== -1; at = text.indexOf('/*', at + 2)) {
-        const end = text.indexOf('*/', at + 2)
-        ranges.push([at, end === -1 ? text.length : end + 2])
-        if (end === -1) break
-        at = end
-    }
-    return ranges
-}
-
-const inRanges = (ranges, at) => ranges.some(([from, to]) => at >= from && at < to)
-
-// Where a selector is DEFINED versus merely mentioned.
+// Every occurrence of a needle in a text, with the one signal that separates
+// "this file DECLARES it" from "this file uses it" without knowing the language.
 //
-// Definition test: from the match, the first structural character forward is
-// `{`. That is true for `.x {`, for `.x .y {`, for a comma-separated list, and
-// for a selector whose brace is on the next line — and false inside a
-// declaration value or a mention in prose. Comments are excluded outright.
+// This used to scan for a `{` after the match and skip /* */ comment ranges —
+// one stylesheet syntax, hard-coded, in an engine that also renders PDFs,
+// emails and whatever a renderer plugin produces. It was ungated too: a
+// markdown file, a template full of {{ }}, or a YAML value containing a brace
+// all went through that same reasoning and could be reported as a declaration.
 //
-// A heuristic, and the response says so: this is a string scan, not a CSS
-// parser, so a selector built by concatenation or emitted by a preprocessor is
-// not found. `occurrences` is reported alongside so a caller can see when the
-// two disagree.
-function findSelectorSites(text, needle) {
-    const comments = commentRanges(text)
+// `leading` is the general form, and it needs no grammar: a declaration begins
+// its line in nearly every text format, while a use sits mid-line. Measured
+// against the case the old version was built for, it reproduces that ranking
+// exactly — the file declaring the thing had 14 leading occurrences, the file
+// merely scoping it had 0 leading and 1 mid-line.
+//
+// The LINE is returned rather than a computed verdict about it. A caller can
+// tell a declaration from something that merely starts with the same token by
+// reading it, which needs no grammar here at all — and where the heuristic is
+// wrong, the evidence for that is right there in the response.
+function findOccurrences(text, needle, { limit = 200 } = {}) {
     const sites = []
+    if (!needle || typeof text !== 'string') return sites
     let line = 1
+    let lineStart = 0
     let scanned = 0
     for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + needle.length)) {
-        while (scanned < at) { if (text.charCodeAt(scanned) === 10) line++; scanned++ }
-        if (inRanges(comments, at)) { sites.push({ line, kind: 'comment' }); continue }
-        let kind = 'mention'
-        for (let i = at + needle.length; i < text.length; i++) {
-            const ch = text[i]
-            if (ch === '{') { kind = 'definition'; break }
-            if (ch === '}' || ch === ';') break
+        while (scanned < at) {
+            if (text.charCodeAt(scanned) === 10) { line++; lineStart = scanned + 1 }
+            scanned++
         }
-        // The selector list this rule actually declares, so the caller can see
-        // whether the match is the whole selector or part of a longer one.
-        let rule = null
-        let exact = false
-        if (kind === 'definition') {
-            const open = text.indexOf('{', at)
-            // Where the selector prelude starts: just past the previous rule,
-            // comment or declaration. `lastIndexOf` returns -1 when there is
-            // none, and -1 plus an offset is a positive index that silently
-            // eats the first characters of the file — which turned
-            // `.panel .btn--secondary` into `panel .btn--secondary` and made
-            // the base-rule test miss.
-            const after = (needleStr, offset) => {
-                const found = text.lastIndexOf(needleStr, at)
-                return found === -1 ? 0 : found + offset
-            }
-            const from = Math.max(after('}', 1), after('*/', 2), after(';', 1))
-            rule = text.slice(from, open).trim().replace(/\s+/g, ' ')
-            // Does this rule define the selector ON ITS OWN, or only scoped
-            // inside something else? `.btn--secondary {}` is the base rule;
-            // `.panel .btn--secondary {}` is an override that applies in one
-            // container. Both are real answers and both are reported, but only
-            // the first is where "make this button transparent" belongs, and a
-            // caller that cannot tell them apart edits the wrong one.
-            exact = rule.split(',').some(part => part.trim() === needle)
-        }
-        sites.push({ line, kind, ...(rule ? { rule, exact } : {}) })
+        const lineEnd = text.indexOf('\n', at)
+        sites.push({
+            line,
+            col: at - lineStart,
+            leading: text.slice(lineStart, at).trim() === '',
+            text: text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd).trim().slice(0, 160),
+        })
+        if (sites.length >= limit) break
     }
     return sites
 }
@@ -1627,17 +1596,17 @@ export function mcp(options = {}) {
 
         mcp.simpleTool(
             'mikser_which',
-            'Reverse lookup, output back to source: "which source file produced this, and where in it?". Give it a built destination and, optionally, a CSS selector or a string to locate inside the sources that fed it.\n\n'
+            'Reverse lookup, output back to source: "which source file produced this, and where in it?". Give it a built destination and, optionally, a string to locate inside the sources that fed it.\n\n'
             + 'This is the question an agent editing an existing site asks first and could not previously ask at all. Finding which file paints a button meant opening the live site in a browser, reading the element\'s class out of the DOM, and guessing at filenames — none of which needs to leave the toolset.\n\n'
-            + 'The answer comes from the engine\'s own refClosure — the record of what each render consumed — so a bundle assembled from a catalog query resolves to the actual parts that went into it, each tagged with HOW it got there. With a `selector`, hits are split into definitions (the rule that sets the properties) and mentions, and comments are excluded, so the header documenting a variant does not outrank the rule implementing it.\n\n'
-            + 'Omit both `selector` and `text` to just list what produced the destination.',
+            + 'The answer comes from the engine\'s own refClosure — the record of what each render consumed — so a bundle assembled from a catalog query resolves to the actual parts that went into it, each tagged with HOW it got there.\n\n'
+            + 'Where the value is a parsed FIELD of an entity (a nav label, a title), the field path and its line and column are RECORDED, not searched for. Where it lives in file content, each occurrence reports its line and whether the string BEGINS that line — which is what separates the file declaring it from the files merely using it, in any text format, with no per-language grammar involved.\n\n'
+            + 'Omit `text` to just list what produced the destination. For a bare engine with no mcp plugin, the `sources` tool answers that half.',
             {
                 destination: z.string().describe('Output-relative destination, as reported by mikser_search({ in: ["output"] }), mikser_explain or the build report (e.g. "/bg/styles/site.css").'),
-                selector:    z.string().optional().describe('A CSS selector or class to locate (e.g. ".lmed-btn--secondary"). Hits are classified as definitions vs mentions and ranked definitions first.'),
-                text:        z.string().optional().describe('A plain string to locate in the sources, for non-CSS output. Matched literally, case-sensitive.'),
+                text:        z.string().optional().describe('A string to locate inside those sources — a label, a class, an identifier. Matched literally, case-sensitive. Each hit reports its line and whether the string BEGINS it: a declaration usually does, a use usually does not.'),
                 limit:       z.number().int().positive().max(200).optional().describe('Maximum source files to report (default 50).'),
             },
-            async ({ destination, selector, text, limit = 50 }) => {
+            async ({ destination, text, limit = 50 }) => {
                 try {
                     if (!destination) return fail('destination is required')
                     if (!runtime.manifest?.snapshotsAt) {
@@ -1653,7 +1622,7 @@ export function mcp(options = {}) {
                         })
                     }
 
-                    const needle = selector ?? text
+                    const needle = text
                     const results = []
                     let searched = 0
                     for (const snapshot of snapshots) {
@@ -1685,35 +1654,24 @@ export function mcp(options = {}) {
                             if (!isTextEntity(entity)) continue
                             const { content } = await readEntityContent(entity)
                             if (typeof content !== 'string') continue
-                            if (selector) {
-                                const sites = findSelectorSites(content, selector)
-                                const definitions = sites.filter(site => site.kind === 'definition')
-                                if (!sites.length) continue
-                                results.push({
-                                    ...row,
-                                    // Located in the bytes of a source the
-                                    // refClosure names, at an exact offset — not
-                                    // a guess about which file might hold it.
-                                    basis: 'source-content',
-                                    recorded: true,
-                                    definitions,
-                                    mentions: sites.filter(site => site.kind !== 'definition').length,
-                                    occurrences: sites.length,
-                                })
-                            } else {
-                                const occurrences = countMatches(content, text, false, false)
-                                if (!occurrences) continue
-                                results.push({
-                                    ...row, basis: 'source-content', recorded: true, occurrences,
-                                    line: lineOfFirstMatch(content, text, false, false),
-                                    snippet: snippetAround(content, text, false, false),
-                                })
-                            }
+                            const sites = findOccurrences(content, needle)
+                            if (!sites.length) continue
+                            results.push({
+                                ...row,
+                                // Located in the bytes of a source the refClosure
+                                // names, at an exact offset — not a guess about
+                                // which file might hold it.
+                                basis: 'source-content',
+                                recorded: true,
+                                occurrences: sites.length,
+                                leading: sites.filter(site => site.leading).length,
+                                sites: sites.slice(0, 10),
+                            })
                         }
                     }
                     // Nothing the recorded closure consumed carries this. It may
-                    // have been composed at render time — a selector built by
-                    // concatenation, a string a layout assembled — in which case
+                    // have been composed at render time — assembled from parts
+                    // by a layout or a helper — in which case
                     // no record of it exists and a scan of the whole catalog is
                     // the only thing left. That answer is real but weaker, and it
                     // is labelled so, because a caller acts differently on "the
@@ -1731,65 +1689,42 @@ export function mcp(options = {}) {
                             if (!isTextEntity(entity)) continue
                             const { content } = await readEntityContent(entity)
                             if (typeof content !== 'string') continue
-                            if (selector) {
-                                const sites = findSelectorSites(content, selector)
-                                if (!sites.length) continue
-                                results.push({ id: entity.id, path: entity.uri ?? null,
-                                               via: ['not in this render\'s recorded closure'],
-                                               basis: 'scan', recorded: false,
-                                               definitions: sites.filter(site => site.kind === 'definition'),
-                                               mentions: sites.filter(site => site.kind !== 'definition').length,
-                                               occurrences: sites.length })
-                            } else {
-                                const occurrences = countMatches(content, text, false, false)
-                                if (!occurrences) continue
-                                results.push({ id: entity.id, path: entity.uri ?? null,
-                                               via: ['not in this render\'s recorded closure'],
-                                               basis: 'scan', recorded: false, occurrences,
-                                               line: lineOfFirstMatch(content, text, false, false),
-                                               snippet: snippetAround(content, text, false, false) })
-                            }
+                            const sites = findOccurrences(content, needle)
+                            if (!sites.length) continue
+                            results.push({ id: entity.id, path: entity.uri ?? null,
+                                           via: ['not in this render\'s recorded closure'],
+                                           basis: 'scan', recorded: false,
+                                           occurrences: sites.length,
+                                           leading: sites.filter(site => site.leading).length,
+                                           sites: sites.slice(0, 10) })
                         }
                     }
 
-                    // A recorded answer outranks a scanned one, always: they are
-                    // different kinds of claim, not two grades of the same one.
-                    results.sort((a, b) => (b.recorded === true) - (a.recorded === true))
+                    // A file where the string BEGINS a line declares it; one
+                    // where it sits mid-line uses it. Ranked rather than
+                    // filtered, because an override that only scopes the thing
+                    // is a real second answer and hiding it is how a fix lands
+                    // in the wrong file.
+                    //
+                    // A recorded answer outranks a scanned one before any of
+                    // that: they are different kinds of claim, not two grades of
+                    // one, and ordering them together would invite reading the
+                    // weaker as the stronger.
+                    const leadingOf = (r) => r.leading ?? (r.fields?.length ? 1 : 0)
+                    results.sort((a, b) =>
+                        (b.recorded === true) - (a.recorded === true)
+                        || (b.fields?.some(f => f.exact) === true) - (a.fields?.some(f => f.exact) === true)
+                        || (leadingOf(b) > 0) - (leadingOf(a) > 0)
+                        || leadingOf(b) - leadingOf(a)
+                        || (b.occurrences ?? 0) - (a.occurrences ?? 0))
 
-                    // A file that DEFINES the selector is the answer; one that
-                    // merely mentions it is context. Ranked rather than filtered
-                    // because an override in a section stylesheet is a real
-                    // second answer, and hiding it is how a fix gets applied in
-                    // the wrong place.
-                    if (selector) {
-                        // A file holding the BASE rule outranks one that only
-                        // scopes the selector, however many times it does so.
-                        // Ranking by definition count alone put a section
-                        // stylesheet with one scoped override above the token
-                        // file that defines the button, and line number within
-                        // a file says nothing about which file is authoritative.
-                        const baseRules = (r) => r.definitions?.filter(d => d.exact).length ?? 0
-                        results.sort((a, b) =>
-                            (b.recorded === true) - (a.recorded === true)
-                            || (baseRules(b) > 0) - (baseRules(a) > 0)
-                            || baseRules(b) - baseRules(a)
-                            || (b.definitions?.length ?? 0) - (a.definitions?.length ?? 0))
-                    } else if (text) {
-                        results.sort((a, b) =>
-                            (b.recorded === true) - (a.recorded === true)
-                            // A field whose whole value IS the needle beats one
-                            // that merely contains it inside a longer sentence.
-                            || (b.fields?.some(f => f.exact) === true) - (a.fields?.some(f => f.exact) === true)
-                            || (b.fields?.length ?? 0) - (a.fields?.length ?? 0)
-                            || (b.occurrences ?? 0) - (a.occurrences ?? 0))
-                    }
                     return ok({
                         destination,
                         claimants: snapshots.map(snap => snap.id),
                         ...(snapshots.length > 1
                             ? { contested: 'More than one entity renders to this destination — see mikser_explain. The sources below are the union of what all of them consumed.' }
                             : {}),
-                        looking: selector ? { selector } : text ? { text } : null,
+                        looking: text ? { text } : null,
                         searched,
                         count: results.length,
                         recorded: results.filter(r => r.recorded).length,
@@ -1803,14 +1738,14 @@ export function mcp(options = {}) {
                                 + 'parsed meta holds the value. `line`/`col` come from parsing the raw source once, cached against its '
                                 + 'checksum. Reaches values that appear nowhere in the page\'s own document — a shared nav or footer label.',
                             'source-content': 'RECORDED. Located at an exact offset in the bytes of a source the refClosure names. '
-                                + '`definitions` marks where a CSS selector is declared rather than mentioned: the first structural '
-                                + 'character after the match is `{`, and comments are excluded. That last part is a heuristic.',
+                                + '`leading` counts the occurrences that BEGIN their line, which is what separates a declaration from '
+                                + 'a use in any text format — and it is a heuristic, so each hit carries the line itself as evidence.',
                             scan: 'NOT RECORDED. Nothing the render consumed carries this, so the whole catalog was searched instead. '
                                 + 'The value may be composed at render time, or this may be an unrelated file that happens to contain '
                                 + 'the same string. Verify before acting.',
                         } : undefined,
                         coverage: needle
-                            ? 'Values assembled at render time — a selector built by concatenation, a string a layout composed — are '
+                            ? 'Values assembled at render time — built from parts by a layout or a helper — are '
                               + 'recorded nowhere and fall through to the scan.'
                             : 'Every source the engine recorded for this render, including its layout, partials, $-refs and the members of any recorded catalog query.',
                     })

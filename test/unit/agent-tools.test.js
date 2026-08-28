@@ -354,35 +354,36 @@ describe('mikser_which — output back to source', () => {
         assert.deepEqual(buttons.via, ['query {"collection":"styles"}'])
     })
 
-    it('separates the rule that DEFINES a selector from a comment mentioning it', async () => {
+    it('separates a line the string BEGINS from one where it is mentioned', async () => {
         snapshots = [{ id: '/documents/bg/styles.yml', destination: '/bg/styles/site.css',
                        refClosure: [{ kind: 'query', filter: { collection: 'styles' } }] }]
-        const res = payload(await call('mikser_which', { destination: '/bg/styles/site.css', selector: '.btn--secondary' }))
+        const res = payload(await call('mikser_which', { destination: '/bg/styles/site.css', text: '.btn--secondary' }))
         const buttons = res.sources.find(r => r.id === '/styles/tokens/buttons.css')
-        // The fixture names the variant in its header comment and then
-        // implements it. Without the comment exclusion the header wins on
-        // line 2 and the rule looks like an afterthought.
-        assert.equal(buttons.definitions.length, 1)
-        assert.equal(buttons.definitions[0].rule, '.btn--secondary')
-        assert.ok(buttons.definitions[0].line > 2)
-        assert.equal(buttons.mentions, 1)
+        // The fixture names the thing in its header comment and then declares
+        // it. Position on the line tells them apart with no knowledge of the
+        // format: the declaration starts its line, the prose mention does not.
+        assert.equal(buttons.occurrences, 2)
+        assert.equal(buttons.leading, 1)
+        const declaration = buttons.sites.find(site => site.leading)
+        assert.ok(declaration.line > 2, 'the header comment must not be the declaration')
+        // The line is returned as evidence, so a caller can see the heuristic's
+        // input rather than only its verdict.
+        assert.match(declaration.text, /^\.btn--secondary/)
     })
 
-    it('ranks a file that defines the selector above one that only scopes it', async () => {
+    it('ranks the file that declares the string above one that only uses it', async () => {
         snapshots = [{ id: '/documents/bg/styles.yml', destination: '/bg/styles/site.css',
                        refClosure: [{ kind: 'query', filter: { collection: 'styles' } }] }]
-        const res = payload(await call('mikser_which', { destination: '/bg/styles/site.css', selector: '.btn--secondary' }))
+        const res = payload(await call('mikser_which', { destination: '/bg/styles/site.css', text: '.btn--secondary' }))
         assert.equal(res.sources[0].id, '/styles/tokens/buttons.css')
-        // Both define it exactly once, so count cannot break the tie — the
-        // base rule does. `.btn--secondary {}` is where the button lives;
-        // `.panel .btn--secondary {}` only overrides it in one container.
-        assert.equal(res.sources[0].definitions[0].exact, true)
+        assert.ok(res.sources[0].leading > 0)
+
         const panel = res.sources.find(r => r.id === '/styles/sections/panel.css')
-        // The override is still reported — hiding it is how a fix lands in
-        // the wrong file.
+        // Still reported — a file that only scopes the thing is a real second
+        // answer, and hiding it is how a fix lands in the wrong file.
         assert.ok(panel)
-        assert.equal(panel.definitions[0].exact, false)
-        assert.equal(panel.definitions[0].rule, '.panel .btn--secondary')
+        assert.equal(panel.leading, 0, 'the string does not begin its line there')
+        assert.equal(panel.occurrences, 1)
     })
 
     it('lists what produced a destination when given no needle', async () => {
