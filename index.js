@@ -50,6 +50,7 @@ import {
     checksum as fileChecksumOf,
     resolveOutputPath,
     isTextEntity,
+    useProvenance,
 } from 'mikser-io'
 import { readFile as readFileAsync, stat as statAsync, readdir as readdirAsync } from 'node:fs/promises'
 import packageInfo from 'mikser-io/package.json' with { type: 'json' }
@@ -633,6 +634,60 @@ function findSelectorSites(text, needle) {
         sites.push({ line, kind, ...(rule ? { rule, exact } : {}) })
     }
     return sites
+}
+
+// Fields of an entity's own meta whose value carries the needle, each with the
+// line and column it was WRITTEN at where the format allows.
+//
+// This is the recorded half. The field path comes from the parsed meta the
+// engine is already holding — no scan, no guess, and no cost. The line and
+// column come from `runtime.provenance`, which parses the raw source once and
+// caches the result against the entity's checksum, so a build pays nothing and
+// the first question about a file pays one parse.
+//
+// It reaches what a string scan of the page cannot: a nav label printed on
+// every page of a site by a shared partial appears in no page's own document,
+// and finding it previously meant paging the whole catalog and guessing at a
+// filename.
+async function metaHits(entity, needle) {
+    if (!entity?.meta) return []
+    const matches = []
+    for (const [field, value] of flattenMeta(entity.meta)) {
+        if (!String(value).includes(needle)) continue
+        matches.push({ field, value: String(value) })
+    }
+    if (!matches.length) return []
+    // Positions are an enhancement, never a precondition: a format whose
+    // parser gives no ranges, or a file that has moved since import, still
+    // yields the field path — which is the half that matters most.
+    let positions = {}
+    try {
+        positions = await useProvenance().positionsFor(entity)
+    } catch { /* no database, or nothing parseable — the path still stands */ }
+    return matches.map(match => ({
+        ...match,
+        ...(positions[match.field] ?? {}),
+        exact: match.value === needle,
+    }))
+}
+
+// Which source emitted a string into a built file.
+//
+// Reads the render's recorded closure and asks each consumed entity whether
+// the value is one of its own fields — the same lookup mikser_which does, so
+// the two cannot give different answers to the same question. Returns an empty
+// list rather than guessing when the render composed the value itself.
+async function attributeOutput(destination, needle) {
+    const snapshots = runtime.manifest?.snapshotsAt?.(destination) ?? []
+    const out = []
+    for (const snapshot of snapshots) {
+        for (const source of await sourcesBehind(snapshot)) {
+            const entity = await readEntity({ id: source.id })
+            const fields = await metaHits(entity, needle)
+            if (fields.length) out.push({ id: source.id, via: source.via, fields })
+        }
+    }
+    return out
 }
 
 // The source entities that fed a render, each with HOW it got there.
@@ -1412,8 +1467,9 @@ export function mcp(options = {}) {
                 regex:      z.boolean().optional().describe('Treat `query` as a JavaScript regular expression rather than a literal substring.'),
                 ignoreCase: z.boolean().optional().describe('Case-insensitive matching. Default false.'),
                 limit:      z.number().int().positive().max(200).optional().describe('Maximum hits to return (default 50, max 200). The response says when it stopped early.'),
+                attribute:  z.boolean().optional().describe('Output scope only: for each built file, also name the SOURCE that emitted the match, with field path and line/col where recorded. Costs a provenance lookup per hit, so it is off by default; turn it on once the blast radius is small enough to act on.'),
             },
-            async ({ query, collection, in: where, regex, ignoreCase, limit = 50 }) => {
+            async ({ query, collection, in: where, regex, ignoreCase, limit = 50, attribute }) => {
                 try {
                     if (!query) return fail('query is required')
                     const scopes = where?.length ? where : ['meta', 'content']
@@ -1446,12 +1502,21 @@ export function mcp(options = {}) {
                             try { text = await readFileAsync(file, 'utf8') } catch { continue }
                             const occurrences = countMatches(text, query, regex, ignoreCase)
                             if (!occurrences) continue
-                            hits.push({
-                                destination: '/' + path.relative(outputFolder, file).split(path.sep).join('/'),
+                            const destination = '/' + path.relative(outputFolder, file).split(path.sep).join('/')
+                            const hit = {
+                                destination,
                                 where: 'output',
                                 occurrences,
                                 snippet: snippetAround(text, query, regex, ignoreCase),
-                            })
+                            }
+                            // Which source put it there. The same recorded
+                            // closure mikser_which reads, so a shared nav label
+                            // resolves to the nav document and its field rather
+                            // than to the page it happens to appear on.
+                            if (attribute && !regex) {
+                                hit.emittedBy = await attributeOutput(destination, query)
+                            }
+                            hits.push(hit)
                         }
                         hits.sort((a, b) => b.occurrences - a.occurrences || a.destination.localeCompare(b.destination))
                     }
@@ -1536,16 +1601,35 @@ export function mcp(options = {}) {
                                 claimedBy: snapshots.length > 1 ? snapshot.id : undefined,
                             }
                             if (!needle) { results.push(row); continue }
-                            if (!entity || !isTextEntity(entity)) continue
+                            if (!entity) continue
+                            searched++
+
+                            // First: the value as PARSED. The engine knows this
+                            // entity was consumed by this render (refClosure) and
+                            // knows which field holds this value (its own meta),
+                            // so the answer is looked up rather than inferred —
+                            // and it reaches values that never appear in the
+                            // page's own source, which is most of a shared nav.
+                            const fields = await metaHits(entity, needle)
+                            if (fields.length) {
+                                results.push({ ...row, basis: 'meta-field', recorded: true, fields })
+                                continue
+                            }
+
+                            if (!isTextEntity(entity)) continue
                             const { content } = await readEntityContent(entity)
                             if (typeof content !== 'string') continue
-                            searched++
                             if (selector) {
                                 const sites = findSelectorSites(content, selector)
                                 const definitions = sites.filter(site => site.kind === 'definition')
                                 if (!sites.length) continue
                                 results.push({
                                     ...row,
+                                    // Located in the bytes of a source the
+                                    // refClosure names, at an exact offset — not
+                                    // a guess about which file might hold it.
+                                    basis: 'source-content',
+                                    recorded: true,
                                     definitions,
                                     mentions: sites.filter(site => site.kind !== 'definition').length,
                                     occurrences: sites.length,
@@ -1554,13 +1638,58 @@ export function mcp(options = {}) {
                                 const occurrences = countMatches(content, text, false, false)
                                 if (!occurrences) continue
                                 results.push({
-                                    ...row, occurrences,
+                                    ...row, basis: 'source-content', recorded: true, occurrences,
                                     line: lineOfFirstMatch(content, text, false, false),
                                     snippet: snippetAround(content, text, false, false),
                                 })
                             }
                         }
                     }
+                    // Nothing the recorded closure consumed carries this. It may
+                    // have been composed at render time — a selector built by
+                    // concatenation, a string a layout assembled — in which case
+                    // no record of it exists and a scan of the whole catalog is
+                    // the only thing left. That answer is real but weaker, and it
+                    // is labelled so, because a caller acts differently on "the
+                    // engine recorded this" than on "a string turned up here".
+                    if (needle && !results.length) {
+                        for (const entity of await findEntities(undefined)) {
+                            if (results.length >= limit) break
+                            const fields = await metaHits(entity, needle)
+                            if (fields.length) {
+                                results.push({ id: entity.id, path: entity.uri ?? null,
+                                               via: ['not in this render\'s recorded closure'],
+                                               basis: 'scan', recorded: false, fields })
+                                continue
+                            }
+                            if (!isTextEntity(entity)) continue
+                            const { content } = await readEntityContent(entity)
+                            if (typeof content !== 'string') continue
+                            if (selector) {
+                                const sites = findSelectorSites(content, selector)
+                                if (!sites.length) continue
+                                results.push({ id: entity.id, path: entity.uri ?? null,
+                                               via: ['not in this render\'s recorded closure'],
+                                               basis: 'scan', recorded: false,
+                                               definitions: sites.filter(site => site.kind === 'definition'),
+                                               mentions: sites.filter(site => site.kind !== 'definition').length,
+                                               occurrences: sites.length })
+                            } else {
+                                const occurrences = countMatches(content, text, false, false)
+                                if (!occurrences) continue
+                                results.push({ id: entity.id, path: entity.uri ?? null,
+                                               via: ['not in this render\'s recorded closure'],
+                                               basis: 'scan', recorded: false, occurrences,
+                                               line: lineOfFirstMatch(content, text, false, false),
+                                               snippet: snippetAround(content, text, false, false) })
+                            }
+                        }
+                    }
+
+                    // A recorded answer outranks a scanned one, always: they are
+                    // different kinds of claim, not two grades of the same one.
+                    results.sort((a, b) => (b.recorded === true) - (a.recorded === true))
+
                     // A file that DEFINES the selector is the answer; one that
                     // merely mentions it is context. Ranked rather than filtered
                     // because an override in a section stylesheet is a real
@@ -1575,11 +1704,18 @@ export function mcp(options = {}) {
                         // a file says nothing about which file is authoritative.
                         const baseRules = (r) => r.definitions?.filter(d => d.exact).length ?? 0
                         results.sort((a, b) =>
-                            (baseRules(b) > 0) - (baseRules(a) > 0)
+                            (b.recorded === true) - (a.recorded === true)
+                            || (baseRules(b) > 0) - (baseRules(a) > 0)
                             || baseRules(b) - baseRules(a)
                             || (b.definitions?.length ?? 0) - (a.definitions?.length ?? 0))
                     } else if (text) {
-                        results.sort((a, b) => (b.occurrences ?? 0) - (a.occurrences ?? 0))
+                        results.sort((a, b) =>
+                            (b.recorded === true) - (a.recorded === true)
+                            // A field whose whole value IS the needle beats one
+                            // that merely contains it inside a longer sentence.
+                            || (b.fields?.some(f => f.exact) === true) - (a.fields?.some(f => f.exact) === true)
+                            || (b.fields?.length ?? 0) - (a.fields?.length ?? 0)
+                            || (b.occurrences ?? 0) - (a.occurrences ?? 0))
                     }
                     return ok({
                         destination,
@@ -1590,11 +1726,26 @@ export function mcp(options = {}) {
                         looking: selector ? { selector } : text ? { text } : null,
                         searched,
                         count: results.length,
+                        recorded: results.filter(r => r.recorded).length,
                         sources: results,
+                        // What kind of claim each answer is. A recorded one and a
+                        // scanned one warrant different trust, and a response
+                        // that presents them identically invites the caller to
+                        // treat the weaker as the stronger.
+                        bases: needle ? {
+                            'meta-field': 'RECORDED. The engine consumed this entity for this render (refClosure) and this field of its '
+                                + 'parsed meta holds the value. `line`/`col` come from parsing the raw source once, cached against its '
+                                + 'checksum. Reaches values that appear nowhere in the page\'s own document — a shared nav or footer label.',
+                            'source-content': 'RECORDED. Located at an exact offset in the bytes of a source the refClosure names. '
+                                + '`definitions` marks where a CSS selector is declared rather than mentioned: the first structural '
+                                + 'character after the match is `{`, and comments are excluded. That last part is a heuristic.',
+                            scan: 'NOT RECORDED. Nothing the render consumed carries this, so the whole catalog was searched instead. '
+                                + 'The value may be composed at render time, or this may be an unrelated file that happens to contain '
+                                + 'the same string. Verify before acting.',
+                        } : undefined,
                         coverage: needle
-                            ? 'String scan over the source files the refClosure names, so a selector composed at render time (built by '
-                              + 'concatenation, or emitted by a preprocessor) is not found. `definitions` is a heuristic: the first '
-                              + 'structural character after the match is `{`. Comments are excluded.'
+                            ? 'Values assembled at render time — a selector built by concatenation, a string a layout composed — are '
+                              + 'recorded nowhere and fall through to the scan.'
                             : 'Every source the engine recorded for this render, including its layout, partials, $-refs and the members of any recorded catalog query.',
                     })
                 } catch (err) {
