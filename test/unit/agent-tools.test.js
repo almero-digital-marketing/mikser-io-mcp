@@ -584,8 +584,16 @@ describe('zodShapeFrom — binding the engine\'s own tools into a session', () =
 
     it('carries the description through, which is what a client shows', async () => {
         const { zodShapeFrom } = await import('../../index.js')
-        const shape = zodShapeFrom({ reference: { type: 'string', required: true, description: 'Entity id.' } })
+        const shape = zodShapeFrom({
+            reference: { type: 'string', required: true, description: 'Entity id.' },
+            // The one that regressed: optional() wraps, so a description
+            // applied before it lands on the inner type and the wrapper — what
+            // the client actually reads — reports none.
+            cycles:    { type: 'number', description: 'How many cycles.' },
+        })
         assert.equal(shape.reference.description, 'Entity id.')
+        assert.equal(shape.cycles.description, 'How many cycles.')
+        assert.equal(shape.cycles.isOptional(), true)
     })
 
     it('maps the whole vocabulary, and defaults an unknown type to string', async () => {

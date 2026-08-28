@@ -137,11 +137,35 @@ describe('createMcpSubstrate', () => {
         const substrate = createMcpSubstrate()
         const s = createFakeServer()
         substrate.attach(s)
-        substrate.simpleTool('sugar', 'sugary', { x: { type: 'string' } }, async () => ({}))
+        substrate.simpleTool('sugar', 'sugary', {}, async () => ({}))
         assert.equal(s.tools.length, 1)
         assert.equal(s.tools[0].name, 'sugar')
         assert.equal(s.tools[0].def.description, 'sugary')
-        assert.deepEqual(s.tools[0].def.inputSchema, { x: { type: 'string' } })
+    })
+
+    it('converts the engine\'s neutral schema vocabulary to zod', async () => {
+        // A plugin registering an MCP-only tool should not need a zod
+        // dependency to describe one optional string. `{ type, required?,
+        // description? }` is the engine's vocabulary and is accepted here too.
+        const substrate = createMcpSubstrate()
+        const s = createFakeServer()
+        substrate.attach(s)
+        substrate.simpleTool('neutral', 'n',
+            { x: { type: 'string', description: 'a thing' } }, async () => ({}))
+        const shape = s.tools[0].def.inputSchema
+        assert.equal(typeof shape.x.safeParse, 'function', 'must be a zod type by the time a session sees it')
+        assert.equal(shape.x.isOptional(), true)
+        assert.equal(shape.x.description, 'a thing')
+    })
+
+    it('leaves a real zod shape alone', async () => {
+        const { z } = await import('zod')
+        const substrate = createMcpSubstrate()
+        const s = createFakeServer()
+        substrate.attach(s)
+        const shape = { y: z.number() }
+        substrate.simpleTool('zod', 'z', shape, async () => ({}))
+        assert.equal(s.tools[0].def.inputSchema.y, shape.y, 'the same instance, not a rebuild')
     })
 
     it('recordLogLine retains lines with monotonic seq numbers', () => {

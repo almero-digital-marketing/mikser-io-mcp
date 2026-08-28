@@ -159,11 +159,32 @@ export function zodShapeFrom(inputSchema = {}) {
             : type === 'boolean' ? z.boolean()
             : type === 'array' ? z.array(z.string())
             : z.string()
-        if (spec?.description) field = field.describe(spec.description)
+        // optional() WRAPS, so a description applied before it sits on the
+        // inner type and the wrapper reports none — which is how every
+        // optional parameter would have reached a client undocumented.
         if (!spec?.required) field = field.optional()
+        if (spec?.description) field = field.describe(spec.description)
         shape[name] = field
     }
     return shape
+}
+
+// Accept the engine's neutral schema vocabulary here too.
+//
+// A plugin registering an MCP-ONLY tool — one that means nothing on a CLI,
+// where the caller already has the filesystem — should not have to take a
+// dependency on zod to describe a single optional string. So a schema that
+// looks neutral is converted, and a real zod shape passes through untouched.
+//
+// Detected by behaviour rather than by a flag: a zod type has safeParse, a
+// neutral spec is a plain object carrying `type`.
+function normalizeInputSchema(inputSchema) {
+    if (!inputSchema || typeof inputSchema !== 'object') return inputSchema
+    const values = Object.values(inputSchema)
+    if (!values.length) return inputSchema
+    const neutral = values.every(v =>
+        v && typeof v === 'object' && typeof v.safeParse !== 'function' && typeof v.type === 'string')
+    return neutral ? zodShapeFrom(inputSchema) : inputSchema
 }
 
 export function createMcpSubstrate() {
@@ -243,6 +264,16 @@ export function createMcpSubstrate() {
         // recorded args verbatim — substrate doesn't peek at the
         // shape, it just records and replays.
         registerTool(...args) {
+            // `mcpOnly` keeps a tool OFF the engine's registry, and therefore
+            // off the CLI. Some tools only mean something to a remote client:
+            // a WebDAV mount config is noise to a caller that is already on
+            // the machine with the folders in front of it. Stripped before
+            // replay so it never reaches the SDK as an unknown definition key.
+            const mcpOnly = args[1]?.mcpOnly === true
+            if (args[1] && (mcpOnly || args[1].inputSchema)) {
+                const { mcpOnly: _drop, ...def } = args[1]
+                args = [args[0], { ...def, inputSchema: normalizeInputSchema(def.inputSchema) }, args[2]]
+            }
             registrations.tools.push(args)
             const name = args[0]
             // Also into the ENGINE's registry, which is what the CLI reads —
@@ -258,7 +289,7 @@ export function createMcpSubstrate() {
             // fields the engine cares about keeps both surfaces exact without
             // pushing MCP's vocabulary into core.
             try {
-                coreRegisterTool(bareName(name), args[1] ?? {}, args[2])
+                if (!mcpOnly) coreRegisterTool(bareName(name), args[1] ?? {}, args[2])
             } catch (err) {
                 runtime.engine?.logger?.debug('Tool %s not mirrored to the engine registry: %s', name, err.message)
             }
@@ -320,7 +351,7 @@ export function createMcpSubstrate() {
         // Convenience helper for the common case: 3-arg tool with
         // description and input schema.
         simpleTool(name, description, inputSchema, handler) {
-            return substrate.registerTool(name, { description, inputSchema }, handler)
+            return substrate.registerTool(name, { description, inputSchema: normalizeInputSchema(inputSchema) }, handler)
         },
 
         // Create a fresh McpServer pre-loaded with every recorded
@@ -357,6 +388,31 @@ export function createMcpSubstrate() {
                 'MCP session detached — active clients: %d', activeServers.size)
         },
         activeServerCount() { return activeServers.size },
+
+        // Who is calling, for a tool registered by another plugin.
+        //
+        // Tool handlers run inside the request's auth context, but that store
+        // is private to this module and a plugin must not import another
+        // plugin's source. So the substrate — the composition seam plugins
+        // already use to register tools — hands out the principal.
+        //
+        // The PRINCIPAL, deliberately, not the credential. Identity and
+        // capabilities are what a tool needs to tailor an answer; handing out
+        // the raw bearer would make every registered tool a place the token
+        // can leak from, to save a caller substituting a string it already
+        // holds.
+        principal() {
+            const principal = authContext.getStore()?.principal
+            if (!principal) return null
+            return {
+                subject: principal.subject ?? null,
+                capabilities: principal.capabilities ?? null,
+                expiresAt: principal.claims?.exp ? new Date(principal.claims.exp * 1000).toISOString() : null,
+                secondsRemaining: principal.claims?.exp
+                    ? Math.max(0, Math.round(principal.claims.exp - Date.now() / 1000))
+                    : null,
+            }
+        },
 
         // The registered tools, and a way to call one without a transport.
         //
