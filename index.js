@@ -133,6 +133,12 @@ let pinoLevelToMcp = (pinoLevel) => {
  * drop-in. Internally it records each registration and replays them
  * on every new per-session Server.
  */
+// The prefix boundary. `mikser_` is MCP's namespacing, not the engine's, so it
+// is stripped when a registration crosses into the engine and re-added when a
+// tool crosses out into a session.
+const bareName = (name) => String(name).replace(/^mikser_/, '')
+const mcpName  = (name) => (String(name).startsWith('mikser_') ? String(name) : `mikser_${name}`)
+
 // Convert the engine's neutral schema vocabulary to zod.
 //
 // The engine registers its own diagnostics (mikser_explain, mikser_verify,
@@ -191,14 +197,19 @@ export function createMcpSubstrate() {
         // this the mirroring is one-way: everything registered here reaches the
         // CLI, but nothing registered there reaches a session, so the engine's
         // own diagnostics would be missing from the surface built for agents.
+        const ownBare = new Set([...ownNames].map(bareName))
         for (const name of coreToolNames()) {
-            if (ownNames.has(name)) continue
-            if (!matchesAny(name, allowedTools)) continue
+            if (ownBare.has(bareName(name))) continue
+            // Prefixed on the way out, because THIS is the namespace that is
+            // flat and shared. The engine stores `explain`; a session sees
+            // `mikser_explain`, indistinguishable from a tool registered here.
+            const exposed = mcpName(name)
+            if (!matchesAny(exposed, allowedTools)) continue
             const schema = coreToolSchema(name)
             if (!schema) continue
             try {
                 server.registerTool(
-                    name,
+                    exposed,
                     { description: schema.description, inputSchema: zodShapeFrom(schema.inputSchema) },
                     (args) => coreInvokeTool(name, args),
                 )
@@ -234,14 +245,20 @@ export function createMcpSubstrate() {
         registerTool(...args) {
             registrations.tools.push(args)
             const name = args[0]
-            // Also into the ENGINE's registry, which is what the CLI reads.
+            // Also into the ENGINE's registry, which is what the CLI reads —
+            // under the BARE name. The `mikser_` prefix is this protocol's:
+            // MCP tool names share one flat namespace across every connected
+            // server, so an unprefixed `search` would collide with anyone
+            // else's. The engine has no such problem, and on the CLI the
+            // prefix is stutter. Stripped here, re-added at bind().
+            //
             // One store would be tidier, but the substrate replays raw
             // registration argument arrays onto each new session server and
             // that shape is MCP's, not the engine's. Mirroring the three
             // fields the engine cares about keeps both surfaces exact without
             // pushing MCP's vocabulary into core.
             try {
-                coreRegisterTool(name, args[1] ?? {}, args[2])
+                coreRegisterTool(bareName(name), args[1] ?? {}, args[2])
             } catch (err) {
                 runtime.engine?.logger?.debug('Tool %s not mirrored to the engine registry: %s', name, err.message)
             }

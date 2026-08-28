@@ -24,8 +24,14 @@ surface. So an agent that runs the CLI and reads its output asks the same
 questions as one speaking MCP:
 
 ```bash
-npx mikser --tool mikser_which --tool-args '{"destination":"/bg/index.html","text":"Контакти"}'
+npx mikser --tool which --tool-args '{"destination":"/bg/index.html","text":"Контакти"}'
 ```
+
+Names are bare on the CLI. The `mikser_` prefix is this protocol's — MCP
+tool names are flat across every connected server, so an unprefixed
+`search` would collide with someone else's — and it is added when a tool
+is bound into a session. A client sees exactly the names it always did;
+either form works from the CLI.
 
 `npx mikser --tools` lists them. stdout carries only the tool's result, so
 piping into `jq` works; exit status is 0 / 1 (the tool reported an error) /
