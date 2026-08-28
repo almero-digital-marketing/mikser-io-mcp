@@ -133,6 +133,33 @@ let pinoLevelToMcp = (pinoLevel) => {
  * drop-in. Internally it records each registration and replays them
  * on every new per-session Server.
  */
+// Convert the engine's neutral schema vocabulary to zod.
+//
+// The engine registers its own diagnostics (mikser_explain, mikser_verify,
+// mikser_build_report) so they exist without this plugin. It declares their
+// inputs as `{ name: { type, required?, description? } }` rather than as zod,
+// because the registry is transport agnostic and the engine should not take a
+// dependency on one transport's schema library.
+//
+// Converting here is the cost of that, and it is small on purpose: the
+// vocabulary covers string / number / boolean / array and nothing else. A tool
+// wanting more expressive validation registers through this substrate with real
+// zod, which is what every tool in this file does.
+export function zodShapeFrom(inputSchema = {}) {
+    const shape = {}
+    for (const [name, spec] of Object.entries(inputSchema)) {
+        const type = spec?.type ?? 'string'
+        let field = type === 'number' ? z.number()
+            : type === 'boolean' ? z.boolean()
+            : type === 'array' ? z.array(z.string())
+            : z.string()
+        if (spec?.description) field = field.describe(spec.description)
+        if (!spec?.required) field = field.optional()
+        shape[name] = field
+    }
+    return shape
+}
+
 export function createMcpSubstrate() {
     // Recorded registrations, replayed on each new session server so
     // late-arriving clients see the same tool surface as early ones.
@@ -153,10 +180,33 @@ export function createMcpSubstrate() {
     function bind(server, filters = {}) {
         const { allowedTools, allowedResources, allowedPrompts } = filters
         const bound = { tools: 0, resources: 0, prompts: 0 }
+        const ownNames = new Set(registrations.tools.map(([name]) => name))
         for (const args of registrations.tools) {
             if (!matchesAny(args[0], allowedTools)) continue
             server.registerTool(...args)
             bound.tools++
+        }
+        // Tools registered directly against the ENGINE — its own diagnostics,
+        // and anything a plugin registers without going through here. Without
+        // this the mirroring is one-way: everything registered here reaches the
+        // CLI, but nothing registered there reaches a session, so the engine's
+        // own diagnostics would be missing from the surface built for agents.
+        for (const name of coreToolNames()) {
+            if (ownNames.has(name)) continue
+            if (!matchesAny(name, allowedTools)) continue
+            const schema = coreToolSchema(name)
+            if (!schema) continue
+            try {
+                server.registerTool(
+                    name,
+                    { description: schema.description, inputSchema: zodShapeFrom(schema.inputSchema) },
+                    (args) => coreInvokeTool(name, args),
+                )
+                bound.tools++
+            } catch (err) {
+                runtime.engine?.logger?.debug(
+                    'Engine tool %s not bound to this session: %s', name, err.message)
+            }
         }
         for (const args of registrations.resources) {
             // Resource registrations are (name, uri, config, handler).
@@ -1856,72 +1906,8 @@ export function mcp(options = {}) {
         // CLI formats, so there is one implementation of each answer rather
         // than a second one that drifts.
 
-        mcp.simpleTool(
-            'mikser_explain',
-            'Explain ONE entity: which layout claimed it and why, its destination, which inputs moved since it last rendered, every dependency edge with what it resolved to (and whether that target is now gone), whether its last render attempt threw, and a verdict on whether a build would re-render it. Accepts an id, a meta.href, or an id without its extension. This is the first thing to reach for when a page will not rebuild and nothing says why. Note it compares the CATALOG against the manifest: an edit not yet imported reports as `source differs from the catalog`.',
-            { reference: z.string().describe('Entity id, meta.href, or id without its extension.') },
-            async ({ reference }) => {
-                try {
-                    const report = await explain(reference)
-                    // found:false is an answer, not a failure — it carries a
-                    // hint about why nothing matched, which is the useful
-                    // half when an agent has guessed at an id.
-                    return ok(report)
-                } catch (err) {
-                    logger.error('MCP mikser_explain error: %s', err.message)
-                    return fail(err.message)
-                }
-            },
-        )
 
-        mcp.simpleTool(
-            'mikser_build_report',
-            'What a build cycle did, and why: entities rendered (each with a reason — inputs-changed, ref-changed, query-matched, retry-failed — and the detail behind it), skipped, rendered-but-byte-identical, renders that threw, warnings, and a count of entities gated at import. Each report carries the `cycleId` it describes and when that cycle started and finished.\n\n'
-            + 'Pass `cycles: N` for the last N FINISHED cycles, newest first. Two successive edits are two cycles, and without this the first one is gone by the time you ask — which makes "did my earlier change re-render those pages?" unanswerable from the tools. History keeps the last 10 cycles of this process.\n\n'
-            + 'Warnings include `destination-collision`, raised when two entities wrote the same destination in one cycle: one silently overwrote the other. Empty until a cycle has run in this process.',
-            {
-                cycles: z.number().int().positive().max(10).optional().describe('Return the last N finished cycles, newest first, instead of only the current one. Max 10 (the history limit).'),
-            },
-            async ({ cycles }) => {
-                try {
-                    if (cycles) {
-                        const history = cycleHistory(cycles)
-                        return ok({ cycles: history.length, reports: history })
-                    }
-                    return ok(buildReport())
-                } catch (err) {
-                    logger.error('MCP mikser_build_report error: %s', err.message)
-                    return fail(err.message)
-                }
-            },
-        )
 
-        mcp.simpleTool(
-            'mikser_verify',
-            'Check the output folder against what the manifest recorded: files missing, files whose bytes no longer match, snapshots with no recorded hash, and files on disk no snapshot claims. Answers "is what is deployed what mikser thinks it produced". Does not build or write anything.',
-            {},
-            async () => {
-                try {
-                    if (!runtime.manifest?.verify) {
-                        return fail('No manifest available — nothing to verify against')
-                    }
-                    // The verdict comes FROM the manifest. This used to
-                    // recompute it here from counts, which had already drifted:
-                    // it omitted collisions, so a destination written by two
-                    // entities reported OK. The spread happened to overwrite it
-                    // with the right answer, which is worse than a visible bug —
-                    // the wrong rule sat there reading like the source of truth.
-                    const diff = await runtime.manifest.verify()
-                    return ok({
-                        snapshots: runtime.manifest.size?.() ?? null,
-                        ...diff,
-                    })
-                } catch (err) {
-                    logger.error('MCP mikser_verify error: %s', err.message)
-                    return fail(err.message)
-                }
-            },
-        )
 
         mcp.simpleTool(
             'mikser_refs_broken',

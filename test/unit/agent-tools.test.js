@@ -564,3 +564,48 @@ describe('mikser_read_entity include: ["positions"]', () => {
         assert.match(res.positionsNote, /field paths in `meta` are still exact/)
     })
 })
+
+describe('zodShapeFrom — binding the engine\'s own tools into a session', () => {
+    // The engine registers its diagnostics without zod, because the registry is
+    // transport agnostic and should not depend on one transport's schema
+    // library. Converting here is the cost of that, and the vocabulary is
+    // deliberately small: anything richer would be a schema language, which the
+    // engine has no business owning.
+    it('marks a required field required and everything else optional', async () => {
+        const { zodShapeFrom } = await import('../../index.js')
+        const shape = zodShapeFrom({
+            reference: { type: 'string', required: true },
+            cycles:    { type: 'number' },
+        })
+        assert.equal(shape.reference.isOptional(), false)
+        assert.equal(shape.cycles.isOptional(), true)
+    })
+
+    it('carries the description through, which is what a client shows', async () => {
+        const { zodShapeFrom } = await import('../../index.js')
+        const shape = zodShapeFrom({ reference: { type: 'string', required: true, description: 'Entity id.' } })
+        assert.equal(shape.reference.description, 'Entity id.')
+    })
+
+    it('maps the whole vocabulary, and defaults an unknown type to string', async () => {
+        const { zodShapeFrom } = await import('../../index.js')
+        const shape = zodShapeFrom({
+            s: { type: 'string', required: true }, n: { type: 'number', required: true },
+            b: { type: 'boolean', required: true }, a: { type: 'array', required: true },
+            weird: { type: 'nonsense', required: true },
+        })
+        assert.equal(shape.s.safeParse('x').success, true)
+        assert.equal(shape.n.safeParse(3).success, true)
+        assert.equal(shape.b.safeParse(true).success, true)
+        assert.equal(shape.a.safeParse(['x']).success, true)
+        // Defaulting rather than throwing: a tool with an odd type should still
+        // be callable, not vanish from the session surface.
+        assert.equal(shape.weird.safeParse('x').success, true)
+    })
+
+    it('handles an empty schema, which mikser_verify has', async () => {
+        const { zodShapeFrom } = await import('../../index.js')
+        assert.deepEqual(zodShapeFrom({}), {})
+        assert.deepEqual(zodShapeFrom(), {})
+    })
+})
