@@ -562,6 +562,11 @@ export function createMcpSubstrate() {
 // stashing it on a session map that would then have to be reaped.
 const authContext = new AsyncLocalStorage()
 
+// The principal store, for tests that need to drive a call as a credential
+// about to expire. Exported rather than reached through a mock because the
+// guard reads the REAL store, and a mock would test the mock.
+export function authContextForTests() { return authContext }
+
 // What mikser_ping can say about the caller's credential.
 //
 // A JWT carries `exp`; a static bearer token has no expiry to report and
@@ -585,15 +590,66 @@ function authStatus() {
     }
     const expiresAt = exp * 1000
     const secondsRemaining = Math.max(0, Math.round((expiresAt - Date.now()) / 1000))
+    const capabilities = principal.capabilities ?? null
     return {
         authenticated: true,
         subject: principal.subject ?? null,
-        capabilities: principal.capabilities ?? null,
+        capabilities,
         expiresAt: new Date(expiresAt).toISOString(),
         secondsRemaining,
+        // What the caller should DO, which depends on whether unattended
+        // renewal is actually available to it.
+        //
+        // `renewable` is reported rather than assumed: the authorization server
+        // grants offline_access alongside every refresh token, but only a
+        // client that kept one can act on it, and this side cannot see that. A
+        // client holding a refresh token renews and never reaches the cliff; a
+        // client that did not keep one still needs a human, and telling it
+        // otherwise would be worse than the old warning.
+        renewable: capabilities?.includes?.('offline_access') ?? null,
         note: secondsRemaining < 300
-            ? 'Expires in under five minutes — finish or re-authenticate before starting anything long.'
-            : 'Sequence long work to finish inside this window.',
+            ? 'Expires in under five minutes. If you hold a refresh token, exchange it now — the '
+              + 'server grants offline_access with every one it issues. Otherwise finish or '
+              + 're-authenticate before starting anything long.'
+            : 'Renew by exchanging your refresh token at any point; the window does not slide on '
+              + 'its own, so a long task should renew rather than race the deadline.',
+    }
+}
+
+// Refuse a mutating call that would land on the wrong side of expiry.
+//
+// The failure this prevents is specific and was reported from a real session:
+// a token that died between a finished decision and the write that would have
+// applied it. A 401 at the gate is fine — nothing happened. A 401 PART WAY
+// THROUGH is not, because the caller cannot tell what landed.
+//
+// So a write checks the remaining window against how long it might take before
+// touching anything. `await: true` blocks for a whole build cycle, which is why
+// it asks for a larger margin than a bare write does.
+//
+// Returns an error envelope to return, or null to proceed.
+function refuseIfExpiringWithin(seconds, what) {
+    const status = authStatus()
+    // No expiry to run out (a static token or a loopback call) — nothing to
+    // guard against, and refusing would break every unauthenticated setup.
+    if (!status.authenticated || status.secondsRemaining === undefined) return null
+    if (status.secondsRemaining > seconds) return null
+    return {
+        isError: true,
+        content: [{
+            type: 'text',
+            text: JSON.stringify({
+                ok: false,
+                refused: 'credential-expiring',
+                secondsRemaining: status.secondsRemaining,
+                expiresAt: status.expiresAt,
+                needed: seconds,
+                what,
+                hint: 'Refused BEFORE writing anything, so nothing is half-applied. Renew the '
+                    + 'credential and retry — the authorization server grants offline_access with '
+                    + 'every refresh token, so a client holding one can renew without a human.',
+            }, null, 2),
+        }],
     }
 }
 
@@ -1891,6 +1947,10 @@ export function mcp(options = {}) {
             },
             async ({ from, to }) => {
                 try {
+                    // This rewrites every referring file in turn. Stopping half
+                    // way leaves the catalog pointing at two names at once.
+                    const refusal = refuseIfExpiringWithin(60, 'a rename across every referring file')
+                    if (refusal) return refusal
                     const result = await runtime.refs.rename({ from, to })
                     return ok(result)
                 } catch (err) {
@@ -2097,6 +2157,15 @@ export function mcp(options = {}) {
                     if (!collection || !relativePath) {
                         return fail('Pass either `id` (for an existing entity) or both `collection` and `relativePath`.')
                     }
+                    // Before the bytes move, not after. A dry run changes
+                    // nothing, so it is never refused.
+                    if (!dryRun) {
+                        const refusal = refuseIfExpiringWithin(
+                            awaitCycle ? 120 : 15,
+                            awaitCycle ? 'a write that then waits for a build cycle' : 'a write')
+                        if (refusal) return refusal
+                    }
+
                     const handle = useCollection(runtime, collection)
                     const uri = path.join(handle.folder, relativePath)
 
@@ -2191,6 +2260,8 @@ export function mcp(options = {}) {
             },
             async ({ collection, relativePath }) => {
                 try {
+                    const refusal = refuseIfExpiringWithin(15, 'a delete')
+                    if (refusal) return refusal
                     await useCollection(runtime, collection).remove(relativePath)
                     return ok({ ok: true, collection, relativePath })
                 } catch (err) {

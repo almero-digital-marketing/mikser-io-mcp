@@ -6,7 +6,7 @@ import path from 'node:path'
 
 import { runtime } from 'mikser-io'
 import { createHarness } from './plugin-harness.js'
-import { mcp } from '../../index.js'
+import { mcp, authContextForTests } from '../../index.js'
 
 // The tools an agent drives when it edits content are the ones that have to
 // answer honestly about disk: what a file currently holds, what is deployed
@@ -608,5 +608,62 @@ describe('zodShapeFrom — binding the engine\'s own tools into a session', () =
         const { zodShapeFrom } = await import('../../index.js')
         assert.deepEqual(zodShapeFrom({}), {})
         assert.deepEqual(zodShapeFrom(), {})
+    })
+})
+
+describe('a write refuses BEFORE it lands on the wrong side of expiry', () => {
+    // The reported failure: a token that died between a finished decision and
+    // the write that would have applied it. A 401 at the gate is fine, nothing
+    // happened. A 401 PART WAY THROUGH is not, because the caller cannot tell
+    // what landed.
+    const withCredential = (secondsRemaining, fn) =>
+        authContextForTests().run({
+            principal: {
+                subject: 'alice',
+                capabilities: ['api:update', 'offline_access'],
+                claims: { exp: Math.floor(Date.now() / 1000) + secondsRemaining },
+            },
+        }, fn)
+
+    it('refuses a write when the window is about to close, and writes nothing', async () => {
+        const before = payload(await call('mikser_read_entity', {
+            id: '/documents/bg/system/navigation.yml', include: ['content'] }))
+        const res = await withCredential(5, () => call('mikser_update_entity', {
+            id: '/documents/bg/system/navigation.yml', content: 'items: []\n' }))
+        assert.equal(res.isError, true)
+        const body = JSON.parse(res.content[0].text)
+        assert.equal(body.refused, 'credential-expiring')
+        assert.match(body.hint, /BEFORE writing anything/)
+
+        const after = payload(await call('mikser_read_entity', {
+            id: '/documents/bg/system/navigation.yml', include: ['content'] }))
+        assert.equal(after.content, before.content, 'the file must be untouched')
+    })
+
+    it('asks for a bigger margin when the call will wait for a build cycle', async () => {
+        // `await: true` blocks for a whole cycle, so 60 seconds left is fine
+        // for a bare write and not fine for that.
+        const bare = await withCredential(60, () => call('mikser_update_entity', {
+            collection: 'documents', relativePath: 'bg/margin-probe.yml', content: 'a: 1\n' }))
+        assert.equal(bare.isError, undefined, 'a bare write has room in 60s')
+
+        const awaited = await withCredential(60, () => call('mikser_update_entity', {
+            collection: 'documents', relativePath: 'bg/margin-probe.yml', content: 'a: 2\n', await: true }))
+        assert.equal(awaited.isError, true)
+        assert.equal(JSON.parse(awaited.content[0].text).needed, 120)
+    })
+
+    it('never refuses a dryRun, which changes nothing', async () => {
+        const res = await withCredential(1, () => call('mikser_update_entity', {
+            id: '/documents/bg/system/navigation.yml', dryRun: true }))
+        assert.equal(res.isError, undefined)
+    })
+
+    it('does not refuse when there is no expiry to run out', async () => {
+        // A static token or a loopback call has no deadline. Refusing those
+        // would break every unauthenticated setup.
+        const res = await call('mikser_update_entity', {
+            collection: 'documents', relativePath: 'bg/no-expiry.yml', content: 'a: 1\n' })
+        assert.equal(res.isError, undefined)
     })
 })
