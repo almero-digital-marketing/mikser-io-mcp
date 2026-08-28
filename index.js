@@ -264,15 +264,8 @@ export function createMcpSubstrate() {
         // recorded args verbatim — substrate doesn't peek at the
         // shape, it just records and replays.
         registerTool(...args) {
-            // `mcpOnly` keeps a tool OFF the engine's registry, and therefore
-            // off the CLI. Some tools only mean something to a remote client:
-            // a WebDAV mount config is noise to a caller that is already on
-            // the machine with the folders in front of it. Stripped before
-            // replay so it never reaches the SDK as an unknown definition key.
-            const mcpOnly = args[1]?.mcpOnly === true
-            if (args[1] && (mcpOnly || args[1].inputSchema)) {
-                const { mcpOnly: _drop, ...def } = args[1]
-                args = [args[0], { ...def, inputSchema: normalizeInputSchema(def.inputSchema) }, args[2]]
+            if (args[1]?.inputSchema) {
+                args = [args[0], { ...args[1], inputSchema: normalizeInputSchema(args[1].inputSchema) }, args[2]]
             }
             registrations.tools.push(args)
             const name = args[0]
@@ -289,7 +282,7 @@ export function createMcpSubstrate() {
             // fields the engine cares about keeps both surfaces exact without
             // pushing MCP's vocabulary into core.
             try {
-                if (!mcpOnly) coreRegisterTool(bareName(name), args[1] ?? {}, args[2])
+                coreRegisterTool(bareName(name), args[1] ?? {}, args[2])
             } catch (err) {
                 runtime.engine?.logger?.debug('Tool %s not mirrored to the engine registry: %s', name, err.message)
             }
