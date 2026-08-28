@@ -51,6 +51,10 @@ import {
     resolveOutputPath,
     isTextEntity,
     useProvenance,
+    registerTool as coreRegisterTool,
+    toolNames as coreToolNames,
+    toolSchema as coreToolSchema,
+    invokeTool as coreInvokeTool,
 } from 'mikser-io'
 import { readFile as readFileAsync, stat as statAsync, readdir as readdirAsync } from 'node:fs/promises'
 import packageInfo from 'mikser-io/package.json' with { type: 'json' }
@@ -178,6 +182,17 @@ export function createMcpSubstrate() {
         registerTool(...args) {
             registrations.tools.push(args)
             const name = args[0]
+            // Also into the ENGINE's registry, which is what the CLI reads.
+            // One store would be tidier, but the substrate replays raw
+            // registration argument arrays onto each new session server and
+            // that shape is MCP's, not the engine's. Mirroring the three
+            // fields the engine cares about keeps both surfaces exact without
+            // pushing MCP's vocabulary into core.
+            try {
+                coreRegisterTool(name, args[1] ?? {}, args[2])
+            } catch (err) {
+                runtime.engine?.logger?.debug('Tool %s not mirrored to the engine registry: %s', name, err.message)
+            }
             let replayed = 0
             const replayErrors = []
             for (const s of activeServers) {
@@ -273,6 +288,22 @@ export function createMcpSubstrate() {
                 'MCP session detached — active clients: %d', activeServers.size)
         },
         activeServerCount() { return activeServers.size },
+
+        // The registered tools, and a way to call one without a transport.
+        //
+        // There are two agent workflows against mikser, not one: an agent
+        // speaking MCP over HTTP, and an agent running the CLI and reading its
+        // output. The second had no access to any of this — every tool built
+        // here was reachable only through a session — which meant the two
+        // workflows saw different engines.
+        //
+        // Exposing the registry rather than hand-rolling a CLI flag per tool
+        // is what makes the parity hold: a tool registered by any plugin, now
+        // or later, is reachable from both surfaces the moment it exists, and
+        // there is no second list to keep in step.
+        toolNames() { return coreToolNames() },
+        toolSchema(name) { return coreToolSchema(name) },
+        async invokeTool(name, args = {}) { return coreInvokeTool(name, args) },
 
         // Send a logging-message notification to every connected
         // client. The SDK's per-session level filtering applies.
@@ -2052,10 +2083,10 @@ export function mcp(options = {}) {
 
         mcp.simpleTool(
             'mikser_read_entity',
-            'Read a single entity by its catalog id (e.g. "/documents/about.md"). Returns the full entity record or null when not found. Pass include: ["content"] to also fetch the source file content from disk — useful for reading a layout template, document frontmatter+body, or any text-format source without dropping out to the filesystem. Binary formats (png/pdf/mp4/etc.) get a `contentSkipped` hint pointing at mikser_render instead of decoded bytes. Pass `expand` to inline referenced entities in the response (per ADR-0007): paths like "author", "author.organization", or "sections.*.image" replace the ref string with the resolved entity in one trip.',
+            'Read a single entity by its catalog id (e.g. "/documents/about.md"). Returns the full entity record or null when not found. Pass include: ["positions"] to also get where each meta field was written — { "items[2].label": { line, col } } — which is how you cite a value or find it again without scanning. Pass include: ["content"] to also fetch the source file content from disk — useful for reading a layout template, document frontmatter+body, or any text-format source without dropping out to the filesystem. Binary formats (png/pdf/mp4/etc.) get a `contentSkipped` hint pointing at mikser_render instead of decoded bytes. Pass `expand` to inline referenced entities in the response (per ADR-0007): paths like "author", "author.organization", or "sections.*.image" replace the ref string with the resolved entity in one trip.',
             {
                 id: z.string().describe('Catalog id of the entity to read.'),
-                include: z.array(z.enum(['content'])).optional().describe('Optional list of extra fields to populate. Currently only "content" is supported: reads the file at entity.uri as utf8 and attaches it as .content. Binary formats get `contentSkipped` instead of garbage utf8.'),
+                include: z.array(z.enum(['content', 'positions'])).optional().describe('Extra fields to populate. "content" reads the file at entity.uri as utf8 and attaches it as .content (binary formats get `contentSkipped` instead of garbage utf8). "positions" attaches `positions`: where each meta field was WRITTEN, as { "items[2].label": { line, col } } — so a value can be cited or found without scanning for it.'),
                 expand: z.array(z.string()).optional().describe('Inline-expand referenced entities. Each entry is a dotted path through $-keyed reference fields. Use `*` for array iteration. Examples: ["author"], ["author.organization"], ["sections.*.image"]. Same caps as mikser_query_entities.'),
                 verbosity: z.enum(['full', 'compact']).optional().describe('"compact" drops the resolved layout template body, which is the bulk of a typical response and is rarely read — mikser_layouts_inspect returns it on purpose. `content` is NEVER trimmed at either setting. Default "full".'),
             },
@@ -2090,6 +2121,28 @@ export function mcp(options = {}) {
                     // Reported whether or not `content` was requested: the meta
                     // form needs no bytes, and the header form reads them here
                     // rather than making the caller ask twice.
+                    // Where each meta field was written. Opt-in for the same
+                    // reason content is: the field paths are free but the line
+                    // and column cost one parse of the source, cached after.
+                    //
+                    // This is the agent-shaped answer to "which line holds
+                    // this value" — the question the old guide plugin answered
+                    // with a tooltip in a browser. An editing agent never
+                    // looks at rendered bytes, so it wants the position as
+                    // data on the read it was already doing.
+                    if (entity && include?.includes('positions')) {
+                        try {
+                            entity.positions = await useProvenance().positionsFor(entity)
+                        } catch {
+                            entity.positions = {}
+                        }
+                        if (!Object.keys(entity.positions).length) {
+                            entity.positionsNote = 'No positions available for this entity — a synthetic '
+                                + 'entity with no source, a format whose parser reports none and that has '
+                                + 'registered no probe, or a file that failed to parse. The field paths in '
+                                + '`meta` are still exact.'
+                        }
+                    }
                     const advisories = entity ? contentAdvisories(
                         entity,
                         typeof entity.content === 'string' ? entity.content : await readIfText(entity.uri)) : []

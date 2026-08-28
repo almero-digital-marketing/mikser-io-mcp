@@ -530,3 +530,37 @@ describe('mikser_update_entity dryRun', () => {
         assert.match(res.note, /not in the catalog yet/)
     })
 })
+
+// Positions come out of the `mikser_provenance` table, and this harness runs
+// against a catalog stub with no database — deliberately, because giving it a
+// real one makes core's findEntities query sqlite instead of the stub and every
+// fixture here disappears. So what is tested here is the WIRING and the
+// degradation; that the positions themselves are correct is tested against real
+// parsers in mikser-io's own test/unit/provenance.test.js.
+describe('mikser_read_entity include: ["positions"]', () => {
+    it('is opt-in — a plain read does not pay the parse', async () => {
+        const res = payload(await call('mikser_read_entity', { id: '/documents/bg/system/navigation.yml' }))
+        assert.equal(res.positions, undefined)
+    })
+
+    it('attaches positions when asked, and never throws when it cannot', async () => {
+        // With no provenance table reachable this degrades to {} plus a note.
+        // The degradation is the point: a read must not fail because a
+        // diagnostic could not be computed.
+        const res = payload(await call('mikser_read_entity', {
+            id: '/documents/bg/system/navigation.yml', include: ['positions'],
+        }))
+        assert.ok(res.positions, 'positions must be present when requested')
+        assert.equal(typeof res.positions, 'object')
+    })
+
+    it('says so when nothing can be placed, rather than returning silence', async () => {
+        // An empty object reads as "this file has no fields"; the note says
+        // which of the two it actually is, and that the paths still hold.
+        const res = payload(await call('mikser_read_entity', {
+            id: '/files/img/logo.png', include: ['positions'],
+        }))
+        assert.deepEqual(res.positions, {})
+        assert.match(res.positionsNote, /field paths in `meta` are still exact/)
+    })
+})

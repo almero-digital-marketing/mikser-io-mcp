@@ -16,13 +16,32 @@ MCP (Model Context Protocol) substrate and tools for [mikser-io](https://github.
   - *Liveness* — `mikser_ping`, which also reports how the caller is authenticated and when that credential expires.
 - **The MCP-UI surface** — `ui://mikser/preview-ui-shell` resource (MCP Apps spec shell), `mikser_preview_ui` (render an entity's `mcpUi` layout to the spec), `mikser_ui_action` (action delivery + optional HMAC-signed webhook forwarding), `mcp-ui/modes` resource for layout discovery, plus `mikser_preview_render` for rendering an entity through the pipeline and returning a clickable preview URL.
 
+## Also reachable from the CLI
+
+Every tool here is registered into the **engine's** registry
+(`mikser-io`'s `registerTool`), not only into this plugin's session
+surface. So an agent that runs the CLI and reads its output asks the same
+questions as one speaking MCP:
+
+```bash
+npx mikser --tool mikser_which --tool-args '{"destination":"/bg/index.html","text":"Контакти"}'
+```
+
+`npx mikser --tools` lists them. stdout carries only the tool's result, so
+piping into `jq` works; exit status is 0 / 1 (the tool reported an error) /
+3 (no such tool, or bad `--tool-args`). See mikser-io's
+`docs/diagnostics.md` under "The two agent workflows".
+
 ## Editing content
 
 `mikser_update_entity` writes the WHOLE file — there is no partial-edit or
 patch mode. Three fields make that safe to do without a shell on the box:
 
 ```js
-const page = await mikser_read_entity({ id: '/styles/tokens/buttons.css', include: ['content'] })
+const page = await mikser_read_entity({ id: '/styles/tokens/buttons.css', include: ['content', 'positions'] })
+// page.positions says where each meta field was written —
+//   { 'items[2].label': { line: 7, col: 13 } } — so a value can be cited or
+//   found again without scanning the file for it.
 // page.contentComplete tells you whether `content` is the whole file or a
 // truncated copy. Never write back from a truncated read.
 // page.advisories names a file you must not edit blind — see below.
