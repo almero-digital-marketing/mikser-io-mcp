@@ -1937,13 +1937,14 @@ export function mcp(options = {}) {
                     if (!runtime.manifest?.verify) {
                         return fail('No manifest available — nothing to verify against')
                     }
+                    // The verdict comes FROM the manifest. This used to
+                    // recompute it here from counts, which had already drifted:
+                    // it omitted collisions, so a destination written by two
+                    // entities reported OK. The spread happened to overwrite it
+                    // with the right answer, which is worse than a visible bug —
+                    // the wrong rule sat there reading like the source of truth.
                     const diff = await runtime.manifest.verify()
-                    const errors = diff.missing.length + diff.mismatched.length
-                    const warnings = diff.orphaned.length + diff.unverifiable.length
                     return ok({
-                        // Same verdict vocabulary the CLI exits on, so a
-                        // caller does not have to re-derive it from counts.
-                        verdict: errors > 0 ? 'FAIL' : warnings > 0 ? 'WARN' : 'OK',
                         snapshots: runtime.manifest.size?.() ?? null,
                         ...diff,
                     })
