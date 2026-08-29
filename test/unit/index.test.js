@@ -1,7 +1,11 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtemp, mkdir, writeFile, rm, utimes } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 
 import { createMcpSubstrate, wireLoggerToMcp } from '../../index.js'
+import { runtime, invokeTool, toolResultText } from 'mikser-io'
 
 // A minimal stand-in for @modelcontextprotocol/sdk's McpServer. We don't
 // want the tests to depend on a real transport / session — they verify
@@ -386,5 +390,77 @@ describe('server implementation', () => {
         const svg = Buffer.from(inline.src.split(',')[1], 'base64').toString()
         assert.match(svg, /^<svg /)
         assert.match(svg, /mikser/)
+    })
+})
+
+// Is the code answering you the code on disk?
+//
+// A running node process holds its module graph in memory and never re-reads
+// node_modules, so an upgrade takes effect only on restart. `--watch` hides it:
+// content rebuilds on every save, so the server feels live while the plugin code
+// is whatever was there at boot.
+//
+// That produced three consecutive bug reports against fixes that had already
+// shipped, and `npm ls` could not have caught one of them — it reports the disk,
+// which was right every time. Install time against process start is the question
+// that distinguishes them.
+describe('mikser_ping: staleness', () => {
+    const withModules = async (fn) => {
+        const dir = await mkdtemp(path.join(tmpdir(), 'mikser-stale-'))
+        const add = async (name, version, when) => {
+            const at = path.join(dir, 'node_modules', name)
+            await mkdir(at, { recursive: true })
+            const manifest = path.join(at, 'package.json')
+            await writeFile(manifest, JSON.stringify({ name, version }))
+            if (when) await utimes(manifest, when, when)
+        }
+        try { return await fn(dir, add) } finally { await rm(dir, { recursive: true, force: true }) }
+    }
+
+    // Through the engine registry, which is the same handler the CLI runs and
+    // an MCP session serves — registering the substrate mirrors ping into it
+    // under its bare name. ping reads the runtime singleton, so the working
+    // folder is set there rather than passed in.
+    const ping = async (workingFolder) => {
+        const previous = runtime.options
+        runtime.options = { ...(previous ?? {}), workingFolder }
+        try {
+            createMcpSubstrate()
+            return JSON.parse(toolResultText(await invokeTool('ping', {})))
+        } finally { runtime.options = previous }
+    }
+
+    it('says nothing when every package predates the process', async () => {
+        await withModules(async (dir, add) => {
+            await add('mikser-io-layouts', '2.11.1', new Date(Date.now() - 86_400_000))
+            const r = await ping(dir)
+            assert.deepEqual(r.stale, [], 'a quiet answer is the normal one')
+            assert.ok(r.startedAt, 'the process start is reported either way')
+        })
+    })
+
+    it('names a package installed since the process booted', async () => {
+        await withModules(async (dir, add) => {
+            await add('mikser-io-layouts', '2.11.1', new Date(Date.now() + 3_600_000))
+            const r = await ping(dir)
+            assert.equal(r.stale.length, 1, JSON.stringify(r.stale))
+            assert.equal(r.stale[0].package, 'mikser-io-layouts')
+            assert.equal(r.stale[0].version, '2.11.1', 'the version on DISK, not the one loaded')
+        })
+    })
+
+    it('ignores packages that are not mikser', async () => {
+        await withModules(async (dir, add) => {
+            await add('lodash', '4.0.0', new Date(Date.now() + 3_600_000))
+            assert.deepEqual((await ping(dir)).stale, [])
+        })
+    })
+
+    it('says nothing rather than something wrong when it cannot look', async () => {
+        // No node_modules — a pnpm layout, or a working folder that is not an
+        // install root. A guess here would be worse than silence.
+        const r = await ping(path.join(tmpdir(), 'mikser-no-such-dir'))
+        assert.deepEqual(r.stale, [])
+        assert.ok(r.startedAt)
     })
 })

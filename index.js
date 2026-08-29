@@ -20,7 +20,7 @@
 // release-cadence) that put it here.
 import { randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
@@ -565,13 +565,49 @@ export function createMcpSubstrate() {
         }),
     )
 
+
+// Packages installed since this process booted.
+//
+// A running node process holds its module graph in memory and never re-reads
+// node_modules, so an upgrade takes effect only on restart. `--watch` hides
+// this: it rebuilds content on every save, so the server feels live while the
+// plugin code is whatever was on disk at boot.
+//
+// That produced three consecutive bug reports against fixes that had already
+// shipped, and `npm ls` could not have caught any of them — it reports the DISK,
+// which was correct every time. Install time against process start is the
+// question worth asking, and both halves are cheap.
+//
+// Best-effort by design: no node_modules, an unreadable package, or a
+// pnpm/yarn-pnp layout simply yields nothing rather than a wrong answer.
+function stalePackages(workingFolder) {
+    const startedAt = Date.now() - Math.round(process.uptime() * 1000)
+    let names = []
+    const root = path.join(workingFolder ?? '.', 'node_modules')
+    try {
+        names = readdirSync(root).filter(n => n === 'mikser-io' || n.startsWith('mikser-io-'))
+    } catch { return { startedAt: new Date(startedAt).toISOString(), stale: [] } }
+
+    const stale = []
+    for (const name of names.sort()) {
+        try {
+            const manifest = path.join(root, name, 'package.json')
+            const installedAt = statSync(manifest).mtimeMs
+            if (installedAt <= startedAt) continue
+            const { version } = JSON.parse(readFileSync(manifest, 'utf8'))
+            stale.push({ package: name, version, installedAt: new Date(installedAt).toISOString() })
+        } catch { /* unreadable — say nothing rather than something wrong */ }
+    }
+    return { startedAt: new Date(startedAt).toISOString(), stale }
+}
+
     // Built-in liveness/identity tool. Also ensures tools/list works
     // before any plugin has registered (McpServer only advertises
     // tools/list capability after at least one registration).
     substrate.registerTool(
         'mikser_ping',
         {
-            description: 'Return mikser engine identity, current lifecycle phase, and (if --server is on) where the HTTP server is reachable. Use to confirm the connection is live before issuing other tool calls and to learn the base URL for preview outputs.',
+            description: 'Return mikser engine identity, current lifecycle phase, and (if --server is on) where the HTTP server is reachable. Use to confirm the connection is live before issuing other tool calls and to learn the base URL for preview outputs.\n\nCheck `stale` before trusting any other tool, and before reporting a bug: it lists mikser packages installed SINCE this process booted, whose code is therefore not the code answering you. A running process never re-reads node_modules, and --watch does not change that — it reloads content, not dependencies. When `stale` is non-empty the fix is a restart, not a bug report.',
             inputSchema: {},
         },
         async () => ({
@@ -585,6 +621,9 @@ export function createMcpSubstrate() {
                     workingFolder: runtime.options.workingFolder,
                     outputFolder: runtime.options.outputFolder,
                     activeClients: substrate.activeServerCount(),
+                    // Empty is the normal case and means what it says: the code
+                    // answering you is the code on disk.
+                    ...stalePackages(runtime.options.workingFolder),
                     server: serverInfo(),
                     // Whether this connection is authenticated and for how
                     // much longer, so a long task can be sequenced rather
