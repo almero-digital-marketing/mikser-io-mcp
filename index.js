@@ -1047,13 +1047,16 @@ async function findEntityAtUri(uri) {
 
 // The file's text, or null. Not an error path: a caller writing a .png has no
 // header to read and nothing has gone wrong.
+//
+// Goes through readEntityContent so "is this text" is answered in exactly one
+// place, by reading the bytes. The extension check that stood here meant a
+// generated-file header in a .njk or .toml was never seen, so the advisory
+// that exists to stop a caller editing a generated file stayed silent for
+// every format the list had not heard of.
 async function readIfText(uri) {
-    if (!isTextEntity({ uri })) return null
-    try {
-        return await readFileAsync(uri, 'utf8')
-    } catch {
-        return null
-    }
+    if (!uri) return null
+    const { content } = await readEntityContent({ uri })
+    return typeof content === 'string' ? content : null
 }
 
 export function contentAdvisories(entity, content) {
@@ -1717,10 +1720,13 @@ export function mcp(options = {}) {
                         }
                         if (hits.length >= limit) { truncated = true; break }
                         if (scopes.includes('content')) {
-                            // Text formats only. readEntityContent already owns
-                            // the text/binary decision, so a png is skipped here
-                            // for the same reason it is skipped everywhere else.
-                            if (!isTextEntity(entity)) continue
+                            // readEntityContent owns the text/binary decision
+                            // and now makes it by reading the bytes. The
+                            // extension pre-filter that used to stand here
+                            // duplicated that decision with the WRONG rule: a
+                            // content search silently skipped every .njk,
+                            // .toml and .ect in the project, and reported the
+                            // same "no matches" it reports for a real absence.
                             const { content } = await readEntityContent(entity)
                             if (typeof content !== 'string' || !matcher.test(content)) continue
                             hits.push({ id: entity.id, collection: entity.collection ?? null, path: entity.uri ?? null,
@@ -1795,7 +1801,6 @@ export function mcp(options = {}) {
                                 continue
                             }
 
-                            if (!isTextEntity(entity)) continue
                             const { content } = await readEntityContent(entity)
                             if (typeof content !== 'string') continue
                             const sites = findOccurrences(content, needle)
@@ -1830,7 +1835,6 @@ export function mcp(options = {}) {
                                                basis: 'scan', recorded: false, fields })
                                 continue
                             }
-                            if (!isTextEntity(entity)) continue
                             const { content } = await readEntityContent(entity)
                             if (typeof content !== 'string') continue
                             const sites = findOccurrences(content, needle)
@@ -2179,7 +2183,13 @@ export function mcp(options = {}) {
                         // what "load this entity's content" means,
                         // shared across any consumer that wants the
                         // text/binary gate.
-                        Object.assign(entity, await readEntityContent(entity))
+                        // `reload` because the catalog copy is what the last
+                        // build saw. Without it this returned that copy while
+                        // reporting it had read the file — so a caller doing
+                        // read → edit → write rewrote the whole file from a
+                        // version it never saw, discarding whatever had
+                        // changed underneath.
+                        Object.assign(entity, await readEntityContent(entity, { reload: true }))
                         // `content` is the whole file, always. A caller's only
                         // write mode is a whole-file rewrite, so a truncated or
                         // transformed copy would be a silent data-loss machine:
