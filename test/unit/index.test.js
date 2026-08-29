@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import { createMcpSubstrate, wireLoggerToMcp } from '../../index.js'
-import { runtime, invokeTool, toolResultText } from 'mikser-io'
+import { runtime, invokeTool, toolResultText, writeEntitySource } from 'mikser-io'
 
 // A minimal stand-in for @modelcontextprotocol/sdk's McpServer. We don't
 // want the tests to depend on a real transport / session — they verify
@@ -485,15 +485,38 @@ describe('checksum guidance points somewhere reachable', () => {
     }
 
     it('never tells a refused writer to re-read for the checksum', async () => {
-        const src = await readFile(new URL('../../index.js', import.meta.url), 'utf8')
-        const at = src.indexOf("refused: 'checksum-mismatch'")
-        assert.ok(at > 0, 'the refusal branch moved')
-        const branch = src.slice(at, at + 2000)
-        assert.match(branch, /THIS response/,
-            'the refusal must name the value that can satisfy it')
-        assert.doesNotMatch(branch, /retry with the checksum from that read/,
-            'that advice returns the same stale value and cannot be followed')
+        // The guard is the engine's now, so the refusal is produced rather
+        // than grepped for — a source check could only ever pin the half that
+        // still lives in this file.
+        const dir = await mkdtemp(path.join(tmpdir(), 'mikser-mcp-write-'))
+        const docs = path.join(dir, 'documents')
+        await mkdir(docs, { recursive: true })
+        const before = runtime.options
+        runtime.options = { ...runtime.options, documentsFolder: docs }
+        try {
+            await writeFile(path.join(docs, 'a.md'), 'moved on\n')
+            const refusal = await writeEntitySource({
+                collection: 'documents', relativePath: 'a.md',
+                content: 'x', ifChecksum: 'stale-value',
+            })
+            assert.equal(refusal.refused, 'checksum-mismatch')
+            assert.match(refusal.hint, /THIS response/,
+                'the refusal must name the value that can satisfy it')
+            assert.doesNotMatch(refusal.hint, /retry with the checksum from that read/,
+                'that advice returns the same stale value and cannot be followed')
+            assert.ok(refusal.currentChecksum, 'and that value must be in the response')
+        } finally {
+            runtime.options = before
+            await rm(dir, { recursive: true, force: true })
+        }
         void tools
+    })
+
+    it('still says which read to distrust, where the tool speaks', async () => {
+        // The engine cannot name mikser_read_entity; this transport can, and
+        // that half of the advice is what made the loop unbreakable.
+        const src = await readFile(new URL('../../index.js', import.meta.url), 'utf8')
+        assert.match(src, /mikser_read_entity reports the catalog checksum/)
     })
 
     it('says which checksum ifChecksum actually wants', async () => {
