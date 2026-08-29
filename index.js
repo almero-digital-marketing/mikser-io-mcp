@@ -2148,6 +2148,30 @@ export function mcp(options = {}) {
             async ({ id, include, expand, verbosity = 'full' }) => {
                 try {
                     const entity = await readEntity({ id, expand })
+
+                    // The catalog is only as fresh as the last build, so its
+                    // checksum can lag the file on disk. That mattered because
+                    // update_entity's precondition is checked against the DISK:
+                    // handing the catalog's value to `ifChecksum` produced a
+                    // refusal that re-reading could never satisfy, since the
+                    // next read returned the same stale value.
+                    //
+                    // Both are reported, and `differs` says plainly when they
+                    // have parted — the same answer `explain` already gives,
+                    // which was until now the only place a caller could see it.
+                    if (entity?.uri) {
+                        try {
+                            entity.diskChecksum = await fileChecksum(entity.uri)
+                            entity.differs = entity.diskChecksum != null
+                                && entity.checksum != null
+                                && entity.diskChecksum !== entity.checksum
+                            if (entity.differs) {
+                                entity.differsNote = 'The file has changed since the last build. `content` above is '
+                                    + 'the catalog copy; pass `diskChecksum` to update_entity\'s ifChecksum, not `checksum`.'
+                            }
+                        } catch { /* unreadable — say nothing rather than something wrong */ }
+                    }
+
                     if (entity && include?.includes('content')) {
                         // readEntityContent gates on text-extension and
                         // attaches one of { content, contentError,
@@ -2224,7 +2248,7 @@ export function mcp(options = {}) {
                 collection:   z.string().optional().describe('Collection name (e.g. "documents", "layouts"). Required unless `id` is given.'),
                 relativePath: z.string().optional().describe('Path relative to the collection folder (e.g. "blog/2026-06-02-launch.md"). Required unless `id` is given.'),
                 content:      z.string().optional().describe('COMPLETE file content. This replaces the file; anything omitted is deleted. Frontmatter is parsed by the corresponding plugin.'),
-                ifChecksum:   z.string().optional().describe('Precondition: only write if the file\'s current checksum equals this. Use the `checksum` from mikser_read_entity. On mismatch the write is refused and `currentChecksum` is returned — re-read, re-apply your change, retry. Omit to write unconditionally.'),
+                ifChecksum:   z.string().optional().describe('Precondition: only write if the file\'s current DISK checksum equals this. Use `diskChecksum` from mikser_read_entity — its `checksum` is the catalog\'s, which lags the disk between builds and will be refused. On mismatch the write is refused and the disk `currentChecksum` is returned: re-apply your change and retry with that. Omit to write unconditionally.'),
                 await:        z.boolean().optional().describe('Block until the cycle that picks up this write completes, and return its build report as `report`. Slower, but answers "what did my edit change" in the same call.'),
                 dryRun:       z.boolean().optional().describe('Write NOTHING. Returns `wouldAffect` — every destination that would re-render, each with the same reason vocabulary the build report uses — plus any advisory on the file and any destination collision already standing at those outputs. Use before touching anything shared.'),
             },
@@ -2303,9 +2327,16 @@ export function mcp(options = {}) {
                             collection, relativePath,
                             expectedChecksum: ifChecksum,
                             currentChecksum: before,
+                            // `currentChecksum` above is the DISK. Saying
+                            // "re-read and use that checksum" was advice that
+                            // could not be followed: mikser_read_entity serves
+                            // the catalog, which is only as fresh as the last
+                            // build, so a file edited since then returns the
+                            // same stale value however many times it is read —
+                            // an unbreakable refusal.
                             hint: before === null
                                 ? 'The file does not exist. Omit ifChecksum to create it.'
-                                : 'The file changed since you read it. Re-read it, re-apply your change to the new content, and retry with the checksum from that read.',
+                                : 'The file on disk changed since you read it. Re-read it for the CONTENT, re-apply your change, and retry with `currentChecksum` from THIS response — mikser_read_entity reports the catalog checksum, which is only current as of the last build and may keep returning the value that was just refused.',
                         })
                     }
 

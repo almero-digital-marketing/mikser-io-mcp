@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, writeFile, rm, utimes } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, rm, utimes, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -462,5 +462,43 @@ describe('mikser_ping: staleness', () => {
         const r = await ping(path.join(tmpdir(), 'mikser-no-such-dir'))
         assert.deepEqual(r.stale, [])
         assert.ok(r.startedAt)
+    })
+})
+
+// The catalog and the disk can disagree, and two tools disagreed with them.
+//
+// mikser_read_entity serves the CATALOG, whose checksum is only as fresh as the
+// last build. update_entity's `ifChecksum` is checked against the DISK. Handing
+// one to the other produced a refusal that re-reading could never satisfy — the
+// next read returned the same stale value — while the tool's own advice was to
+// re-read and retry. An unbreakable loop out of two individually correct halves.
+//
+// The behaviour is verified against a live catalog; what is pinned here is the
+// GUIDANCE, because wrong advice in a tool description is silent and is what
+// made the loop unbreakable rather than merely inconvenient.
+describe('checksum guidance points somewhere reachable', () => {
+    const tools = () => {
+        const substrate = createMcpSubstrate()
+        const captured = []
+        substrate.bindTo?.({ registerTool: (...a) => captured.push(a) })
+        return captured
+    }
+
+    it('never tells a refused writer to re-read for the checksum', async () => {
+        const src = await readFile(new URL('../../index.js', import.meta.url), 'utf8')
+        const at = src.indexOf("refused: 'checksum-mismatch'")
+        assert.ok(at > 0, 'the refusal branch moved')
+        const branch = src.slice(at, at + 2000)
+        assert.match(branch, /THIS response/,
+            'the refusal must name the value that can satisfy it')
+        assert.doesNotMatch(branch, /retry with the checksum from that read/,
+            'that advice returns the same stale value and cannot be followed')
+        void tools
+    })
+
+    it('says which checksum ifChecksum actually wants', async () => {
+        const src = await readFile(new URL('../../index.js', import.meta.url), 'utf8')
+        assert.match(src, /diskChecksum` from mikser_read_entity/)
+        assert.match(src, /differsNote/, 'read_entity flags the divergence rather than hiding it')
     })
 })
