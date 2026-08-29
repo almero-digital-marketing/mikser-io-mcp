@@ -49,7 +49,6 @@ import {
     cycleHistory,
     checksum as fileChecksumOf,
     resolveOutputPath,
-    isTextEntity,
     useProvenance,
     sourcesBehind,
     sourcesOf,
@@ -57,6 +56,12 @@ import {
     toolNames as coreToolNames,
     toolSchema as coreToolSchema,
     invokeTool as coreInvokeTool,
+    // Search lives in the engine, so the CLI, a plugin and this tool all get
+    // the same answer from one implementation.
+    searchEntities,
+    findOccurrences,
+    flattenMeta,
+    looksTextual,
 } from 'mikser-io'
 import { readFile as readFileAsync, stat as statAsync, readdir as readdirAsync } from 'node:fs/promises'
 import packageInfo from 'mikser-io/package.json' with { type: 'json' }
@@ -741,72 +746,6 @@ function refuseIfExpiringWithin(seconds, what) {
     }
 }
 
-// Output extensions worth returning as text. Deliberately a small allowlist
-// rather than a binary sniff: guessing wrong on a font or an image and
-// returning a utf8 read of it produces convincing garbage.
-const TEXT_OUTPUT_EXTENSIONS = new Set([
-    'html', 'htm', 'xml', 'json', 'txt', 'css', 'js', 'mjs', 'svg', 'md',
-    'csv', 'yml', 'yaml', 'rss', 'atom', 'webmanifest', 'map',
-])
-
-// Every leaf value under meta as [dottedPath, value], arrays included.
-// Same shape refs_inbound reports, so a hit here and a referrer there name
-// the same field.
-function* flattenMeta(node, prefix = '') {
-    if (node === null || node === undefined) return
-    if (Array.isArray(node)) {
-        for (let i = 0; i < node.length; i++) yield* flattenMeta(node[i], `${prefix}[${i}]`)
-        return
-    }
-    if (typeof node === 'object') {
-        for (const [key, value] of Object.entries(node)) {
-            yield* flattenMeta(value, prefix ? `${prefix}.${key}` : key)
-        }
-        return
-    }
-    yield [prefix, node]
-}
-
-// How many times the needle appears. A count, not a boolean, because "this
-// class is on nine pages" and "this class is on nine pages and seven times on
-// one of them" are different facts and the second one names the component.
-function countMatches(text, query, regex, ignoreCase) {
-    if (regex) {
-        const re = new RegExp(query, ignoreCase ? 'gi' : 'g')
-        let n = 0
-        // Guard the zero-width case: /a*/g on a non-matching position returns
-        // an empty match forever and never advances.
-        for (let m = re.exec(text); m; m = re.exec(text)) {
-            n++
-            if (m.index === re.lastIndex) re.lastIndex++
-        }
-        return n
-    }
-    const haystack = ignoreCase ? text.toLowerCase() : text
-    const needle = ignoreCase ? query.toLowerCase() : query
-    if (!needle) return 0
-    let n = 0
-    for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + needle.length)) n++
-    return n
-}
-
-// 1-based line of the first match, so a hit is somewhere to go rather than
-// something to grep for again.
-function lineOfFirstMatch(text, query, regex, ignoreCase) {
-    let at = -1
-    if (regex) {
-        const m = new RegExp(query, ignoreCase ? 'i' : '').exec(text)
-        at = m ? m.index : -1
-    } else {
-        const haystack = ignoreCase ? text.toLowerCase() : text
-        at = haystack.indexOf(ignoreCase ? query.toLowerCase() : query)
-    }
-    if (at < 0) return null
-    let line = 1
-    for (let i = 0; i < at; i++) if (text.charCodeAt(i) === 10) line++
-    return line
-}
-
 // Every occurrence of a needle in a text, with the one signal that separates
 // "this file DECLARES it" from "this file uses it" without knowing the language.
 //
@@ -822,33 +761,6 @@ function lineOfFirstMatch(text, query, regex, ignoreCase) {
 // exactly — the file declaring the thing had 14 leading occurrences, the file
 // merely scoping it had 0 leading and 1 mid-line.
 //
-// The LINE is returned rather than a computed verdict about it. A caller can
-// tell a declaration from something that merely starts with the same token by
-// reading it, which needs no grammar here at all — and where the heuristic is
-// wrong, the evidence for that is right there in the response.
-function findOccurrences(text, needle, { limit = 200 } = {}) {
-    const sites = []
-    if (!needle || typeof text !== 'string') return sites
-    let line = 1
-    let lineStart = 0
-    let scanned = 0
-    for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + needle.length)) {
-        while (scanned < at) {
-            if (text.charCodeAt(scanned) === 10) { line++; lineStart = scanned + 1 }
-            scanned++
-        }
-        const lineEnd = text.indexOf('\n', at)
-        sites.push({
-            line,
-            col: at - lineStart,
-            leading: text.slice(lineStart, at).trim() === '',
-            text: text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd).trim().slice(0, 160),
-        })
-        if (sites.length >= limit) break
-    }
-    return sites
-}
-
 // Fields of an entity's own meta whose value carries the needle, each with the
 // line and column it was WRITTEN at where the format allows.
 //
@@ -901,38 +813,6 @@ async function attributeOutput(destination, needle) {
         if (fields.length) out.push({ id: source.id, via: source.via, fields })
     }
     return out
-}
-
-// Every file under the output folder, depth-first. A generator so a search
-// that hits its limit stops walking rather than materializing the tree.
-async function* walkOutputFiles(folder) {
-    let entries
-    try {
-        entries = await readdirAsync(folder, { withFileTypes: true })
-    } catch {
-        return
-    }
-    for (const entry of entries) {
-        const full = path.join(folder, entry.name)
-        if (entry.isDirectory()) yield* walkOutputFiles(full)
-        else if (entry.isFile()) yield full
-    }
-}
-
-// Enough text around the match to recognise it without returning the file.
-function snippetAround(text, query, regex, ignoreCase) {
-    const haystack = ignoreCase ? text.toLowerCase() : text
-    let at = -1
-    if (regex) {
-        const m = new RegExp(query, ignoreCase ? 'i' : '').exec(text)
-        at = m ? m.index : -1
-    } else {
-        at = haystack.indexOf(ignoreCase ? query.toLowerCase() : query)
-    }
-    if (at < 0) return text.slice(0, 120)
-    const start = Math.max(0, at - 60)
-    const end = Math.min(text.length, at + query.length + 60)
-    return (start > 0 ? '…' : '') + text.slice(start, end).replace(/\s+/g, ' ') + (end < text.length ? '…' : '')
 }
 
 // Drop what a caller almost never reads, and never touch `content`.
@@ -1654,89 +1534,29 @@ export function mcp(options = {}) {
             async ({ query, collection, in: where, regex, ignoreCase, limit = 50, attribute }) => {
                 try {
                     if (!query) return fail('query is required')
-                    const scopes = where?.length ? where : ['meta', 'content']
-                    let matcher
+                    let result
                     try {
-                        matcher = regex
-                            ? new RegExp(query, ignoreCase ? 'i' : '')
-                            : { test: (v) => (ignoreCase ? String(v).toLowerCase().includes(query.toLowerCase()) : String(v).includes(query)) }
+                        result = await searchEntities({ query, collection, in: where, regex, ignoreCase, limit })
                     } catch (err) {
-                        return fail(`invalid regex: ${err.message}`)
+                        // A bad regex is the caller's input, not a server
+                        // fault, and it is the one failure worth naming
+                        // precisely — an empty result set would read as "not
+                        // found" for a pattern that never compiled.
+                        if (err instanceof SyntaxError) return fail(`invalid regex: ${err.message}`)
+                        return fail(err.message)
                     }
 
-                    const hits = []
-                    let truncated = false
-
-                    // The output scope walks the deployed folder, not the
-                    // catalog, so it runs on its own and skips the entity loop
-                    // entirely. Counting is the point here rather than
-                    // first-match: seven occurrences on one page and one on
-                    // nine others is the shape of a shared component, and a
-                    // list of nine equal-looking filenames hides it.
-                    if (scopes.includes('output')) {
-                        const outputFolder = runtime.options?.outputFolder
-                        if (!outputFolder) return fail('No output folder configured, so there is no built output to search.')
-                        for await (const file of walkOutputFiles(outputFolder)) {
-                            if (hits.length >= limit) { truncated = true; break }
-                            const ext = file.slice(file.lastIndexOf('.') + 1).toLowerCase()
-                            if (!TEXT_OUTPUT_EXTENSIONS.has(ext)) continue
-                            let text
-                            try { text = await readFileAsync(file, 'utf8') } catch { continue }
-                            const occurrences = countMatches(text, query, regex, ignoreCase)
-                            if (!occurrences) continue
-                            const destination = '/' + path.relative(outputFolder, file).split(path.sep).join('/')
-                            const hit = {
-                                destination,
-                                where: 'output',
-                                occurrences,
-                                snippet: snippetAround(text, query, regex, ignoreCase),
-                            }
-                            // Which source put it there. The same recorded
-                            // closure mikser_which reads, so a shared nav label
-                            // resolves to the nav document and its field rather
-                            // than to the page it happens to appear on.
-                            if (attribute && !regex) {
-                                hit.emittedBy = await attributeOutput(destination, query)
-                            }
-                            hits.push(hit)
-                        }
-                        hits.sort((a, b) => b.occurrences - a.occurrences || a.destination.localeCompare(b.destination))
-                    }
-
-                    const searchesCatalog = scopes.some(scope => scope !== 'output')
-                    const entities = searchesCatalog
-                        ? await findEntities(collection ? { collection } : undefined)
-                        : []
-
-                    for (const entity of entities) {
-                        if (hits.length >= limit) { truncated = true; break }
-                        if (scopes.includes('meta') && entity.meta) {
-                            for (const [field, value] of flattenMeta(entity.meta)) {
-                                if (!matcher.test(value)) continue
-                                hits.push({ id: entity.id, collection: entity.collection ?? null, path: entity.uri ?? null,
-                                            where: 'meta', field, snippet: snippetAround(String(value), query, regex, ignoreCase) })
-                                break
-                            }
-                        }
-                        if (hits.length >= limit) { truncated = true; break }
-                        if (scopes.includes('content')) {
-                            // readEntityContent owns the text/binary decision
-                            // and now makes it by reading the bytes. The
-                            // extension pre-filter that used to stand here
-                            // duplicated that decision with the WRONG rule: a
-                            // content search silently skipped every .njk,
-                            // .toml and .ect in the project, and reported the
-                            // same "no matches" it reports for a real absence.
-                            const { content } = await readEntityContent(entity)
-                            if (typeof content !== 'string' || !matcher.test(content)) continue
-                            hits.push({ id: entity.id, collection: entity.collection ?? null, path: entity.uri ?? null,
-                                        where: 'content', field: null,
-                                        occurrences: countMatches(content, query, regex, ignoreCase),
-                                        line: lineOfFirstMatch(content, query, regex, ignoreCase),
-                                        snippet: snippetAround(content, query, regex, ignoreCase) })
+                    // Attribution stays here rather than in the engine: it
+                    // reads the same recorded closure `which` does, so a
+                    // shared nav label resolves to the nav document and its
+                    // field rather than to the page it happens to appear on.
+                    if (attribute && !regex) {
+                        for (const hit of result.hits) {
+                            if (hit.where !== 'output') continue
+                            hit.emittedBy = await attributeOutput(hit.destination, query)
                         }
                     }
-                    return ok({ query, scopes, count: hits.length, truncated, searched: entities.length, hits })
+                    return ok(result)
                 } catch (err) {
                     logger.error('MCP mikser_search error: %s', err.message)
                     return fail(err.message)
@@ -1924,12 +1744,15 @@ export function mcp(options = {}) {
                                     hint: 'Nothing is deployed at this destination. mikser_explain will say whether anything renders to it.' })
                     }
                     const ext = filePath.slice(filePath.lastIndexOf('.') + 1).toLowerCase()
-                    const text = TEXT_OUTPUT_EXTENSIONS.has(ext)
-                    if (!text) {
+                    // Decided by the bytes, so a .webmanifest or whatever a
+                    // renderer plugin emits is readable without first being
+                    // added to a list of known extensions.
+                    const bytes = await readFileAsync(filePath)
+                    if (!looksTextual(bytes.subarray(0, Math.min(bytes.length, 8 * 1024)))) {
                         return ok({ destination, exists: true, path: filePath, bytes: info.size, binary: true,
                                     contentSkipped: `binary output (.${ext}) is not decoded; ${info.size} bytes on disk` })
                     }
-                    const content = await readFileAsync(filePath, 'utf8')
+                    const content = bytes.toString('utf8')
                     return ok({ destination, exists: true, path: filePath, bytes: info.size, binary: false, content })
                 } catch (err) {
                     logger.error('MCP mikser_read_output error: %s', err.message)
