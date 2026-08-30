@@ -49,6 +49,7 @@ import {
     cycleHistory,
     checksum as fileChecksumOf,
     writeEntitySource,
+    deleteEntitySource,
     contentAdvisories,
     advisoryWarning,
     resolveOutputPath,
@@ -1942,8 +1943,10 @@ export function mcp(options = {}) {
                 ifChecksum:   z.string().optional().describe('Precondition: only write if the file\'s current DISK checksum equals this. Use `diskChecksum` from mikser_read_entity — its `checksum` is the catalog\'s, which lags the disk between builds and will be refused. On mismatch the write is refused and the disk `currentChecksum` is returned: re-apply your change and retry with that. Omit to write unconditionally.'),
                 await:        z.boolean().optional().describe('Block until the cycle that picks up this write completes, and return its build report as `report`. Slower, but answers "what did my edit change" in the same call.'),
                 dryRun:       z.boolean().optional().describe('Write NOTHING. Returns `wouldAffect` — every destination that would re-render, each with the same reason vocabulary the build report uses — plus any advisory on the file and any destination collision already standing at those outputs. Use before touching anything shared.'),
+                changeSet:    z.string().optional().describe('Groups this write with others into ONE undoable unit. Pass the SAME id for every file you touch while carrying out one request, so undoing it takes back the whole request rather than one file of it. Omit and each call becomes its own change set. Requires the git plugin to be durable; without it the id is recorded and unused.'),
+                summary:      z.string().optional().describe('One line describing what this change accomplishes, in the user\'s terms — "change the hero text on the devices page", not "write hero.yml". It becomes the commit subject and is what a person picks from when choosing what to undo, so nothing downstream can reconstruct it if you leave it out.'),
             },
-            async ({ id, collection, relativePath, content = '', ifChecksum, await: awaitCycle, dryRun }) => {
+            async ({ id, collection, relativePath, content = '', ifChecksum, await: awaitCycle, dryRun, changeSet, summary }) => {
                 try {
                     // Before the bytes move, not after. A dry run changes
                     // nothing, so it is never refused.
@@ -1960,6 +1963,11 @@ export function mcp(options = {}) {
                     // write, not of this transport.
                     const result = await writeEntitySource({
                         id, collection, relativePath, content, ifChecksum, dryRun, awaitCycle,
+                        // A set per call when the caller does not group, so a
+                        // write is always attributable — an unattributed write
+                        // is one nothing can ever take back.
+                        changeSet: changeSet ?? (dryRun ? undefined : `cs-${randomUUID()}`),
+                        summary, principal: 'agent',
                     })
 
                     // A refusal that names a bad request stays an error, so a
@@ -1987,17 +1995,39 @@ export function mcp(options = {}) {
 
         mcp.simpleTool(
             'mikser_delete_entity',
-            'Remove a content file from a mikser collection. Deletes the source file; the next lifecycle cycle prunes its rendered outputs from the manifest.',
+            'Remove a content file from a mikser collection. Deletes the source file; the next lifecycle cycle prunes its rendered outputs from the manifest.\n\n'
+            + 'Pass `dryRun` FIRST on anything you did not create yourself. It reports `referencedBy` — everything that '
+            + 'points at this entity and would be left pointing at nothing — and `wouldAffect`, the destinations that '
+            + 'stop being able to render it. A delete is the one write with no content to inspect afterwards, so the '
+            + 'preview is the only chance to see what it costs.\n\n'
+            + '`ifChecksum` makes the delete conditional the same way it does a write: if the file changed since you '
+            + 'read it, someone edited what you are about to remove, and the delete is refused.',
             {
-                collection:   z.string().describe('Collection name.'),
-                relativePath: z.string().describe('Path relative to the collection folder.'),
+                id:           z.string().optional().describe('Catalog id of the entity to delete. Alternative to collection + relativePath.'),
+                collection:   z.string().optional().describe('Collection name. Required unless `id` is given.'),
+                relativePath: z.string().optional().describe('Path relative to the collection folder. Required unless `id` is given.'),
+                ifChecksum:   z.string().optional().describe('Precondition: only delete if the file\'s current DISK checksum equals this. Use `diskChecksum` from mikser_read_entity.'),
+                dryRun:       z.boolean().optional().describe('Delete NOTHING. Reports what references this and what would stop rendering.'),
+                changeSet:    z.string().optional().describe('Groups this delete with other writes into ONE undoable unit. Pass the same id you used for the writes that belong to the same request.'),
+                summary:      z.string().optional().describe('One line describing what this accomplishes, in the user\'s terms. Becomes the commit subject and is what a person picks from when choosing what to undo.'),
             },
-            async ({ collection, relativePath }) => {
+            async ({ id, collection, relativePath, ifChecksum, dryRun, changeSet, summary }) => {
                 try {
-                    const refusal = refuseIfExpiringWithin(15, 'a delete')
-                    if (refusal) return refusal
-                    await useCollection(runtime, collection).remove(relativePath)
-                    return ok({ ok: true, collection, relativePath })
+                    if (!dryRun) {
+                        const refusal = refuseIfExpiringWithin(15, 'a delete')
+                        if (refusal) return refusal
+                    }
+                    const result = await deleteEntitySource({
+                        id, collection, relativePath, ifChecksum, dryRun,
+                        changeSet: changeSet ?? (dryRun ? undefined : `cs-${randomUUID()}`),
+                        summary, principal: 'agent',
+                    })
+                    // A stale checksum is a normal outcome carrying the value
+                    // to retry with; every other refusal is a bad request.
+                    if (!result.ok && result.refused !== 'checksum-mismatch') {
+                        return fail(result.error ?? result.refused)
+                    }
+                    return ok(result)
                 } catch (err) {
                     logger.error('MCP mikser_delete_entity error: %s', err.message)
                     return fail(err.message)
