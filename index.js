@@ -50,6 +50,9 @@ import {
     checksum as fileChecksumOf,
     writeEntitySource,
     withChangeSet,
+    describeAuthority,
+    actingRole,
+    explainRefusal,
     findChangeSet,
     deleteEntitySource,
     contentAdvisories,
@@ -217,7 +220,12 @@ function wrapMutatingHandler(handler) {
         const id = changeSet ?? `cs-${randomUUID()}`
         const result = await withChangeSet(
             {
-                changeSet: id, summary, principal: 'agent',
+                changeSet: id,
+                summary,
+                // Who did it and under what authority. "agent" alone says
+                // nothing a log reader can act on; the subject and the role
+                // are what make an entry answerable months later.
+                principal: actingPrincipal(),
                 // An id minted here belongs to this call alone, so the request
                 // is over when the handler returns and the set can be committed
                 // at once rather than waiting out a batching window meant for
@@ -237,6 +245,19 @@ function wrapMutatingHandler(handler) {
         // nothing is a handle to nothing.
         return attachChangeSet(result, id)
     }
+}
+
+// The identity to stamp on a change set: who, and as what.
+//
+// Falls back to a bare label when there is no credential — a loopback session
+// or an unauthenticated endpoint — because "agent" is still truer there than
+// inventing a subject.
+function actingPrincipal() {
+    const principal = authContext.getStore()?.principal
+    if (!principal) return 'agent'
+    const role = actingRole(principal.roles ?? [], runtime.options.roles?.catalogue ?? {})
+    const subject = principal.subject ?? 'agent'
+    return role ? `${subject} (${role})` : subject
 }
 
 // Fold the id into an MCP result's JSON text block, leaving anything else —
@@ -706,7 +727,7 @@ function stalePackages(workingFolder) {
     substrate.registerTool(
         'mikser_ping',
         {
-            description: 'Return mikser engine identity, current lifecycle phase, and (if --server is on) where the HTTP server is reachable. Use to confirm the connection is live before issuing other tool calls and to learn the base URL for preview outputs.\n\nCheck `stale` before trusting any other tool, and before reporting a bug: it lists mikser packages installed SINCE this process booted, whose code is therefore not the code answering you. A running process never re-reads node_modules, and --watch does not change that — it reloads content, not dependencies. When `stale` is non-empty the fix is a restart, not a bug report.',
+            description: 'Return mikser engine identity, current lifecycle phase, and (if --server is on) where the HTTP server is reachable. Use to confirm the connection is live before issuing other tool calls and to learn the base URL for preview outputs.\n\nCheck `stale` before trusting any other tool, and before reporting a bug: it lists mikser packages installed SINCE this process booted, whose code is therefore not the code answering you. A running process never re-reads node_modules, and --watch does not change that — it reloads content, not dependencies. When `stale` is non-empty the fix is a restart, not a bug report.\n\nThe `auth` block names the ROLE this session acts as, what it may write, what it may only read, and which other roles carry the rest. That is INFORMATIONAL: report what you cannot do and stop. There is no way to request or change a role and none will be added — `otherRoles` names a person to ask, not a privilege to obtain.',
             inputSchema: {},
         },
         async () => ({
@@ -765,11 +786,25 @@ function authStatus() {
     if (!principal) {
         return { authenticated: false, note: 'No credential on this request — loopback or an unauthenticated endpoint.' }
     }
+    // Which role is acting, in words. Capabilities alone cannot answer it —
+    // eighteen of them look the same whether they are a role called admin or a
+    // site with no roles at all — and the answer is what lets an agent explain
+    // a refusal instead of reporting a 403.
+    //
+    // INFORMATIONAL. `otherRoles` names who to ask; there is no way to request
+    // one and none should be added.
+    const authority = describeAuthority({
+        capabilities: principal.capabilities,
+        roles: principal.roles ?? [],
+        catalogue: runtime.options.roles?.catalogue ?? {},
+        summaries: runtime.options.roles?.summaries ?? {},
+    })
     const exp = principal.claims?.exp
     if (!exp) {
         return {
             authenticated: true,
             subject: principal.subject ?? null,
+            ...authority,
             capabilities: principal.capabilities ?? null,
             expiresAt: null,
             note: 'This credential carries no expiry (a static token). It stays valid until it is revoked or the config changes.',
@@ -781,6 +816,7 @@ function authStatus() {
     return {
         authenticated: true,
         subject: principal.subject ?? null,
+        ...authority,
         capabilities,
         expiresAt: new Date(expiresAt).toISOString(),
         secondsRemaining,
