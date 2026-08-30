@@ -619,6 +619,39 @@ describe('zodShapeFrom — binding the engine\'s own tools into a session', () =
     })
 })
 
+describe('renewability is never reported as a flat no', () => {
+    // A real token from mikser-io-auth NEVER carries offline_access: it is a
+    // property of the GRANT, not a capability, and a resource server checking
+    // capabilities must not see it or it becomes a permission nobody granted.
+    // Deriving `renewable` from the capability list could therefore only ever
+    // answer false — to every caller, including every one holding a perfectly
+    // good refresh token.
+    //
+    // false is the one answer that costs something. An agent reading it stops
+    // and asks for a human, which is exactly what the refresh token exists to
+    // avoid; the reported symptom was a one-hour window that never renewed.
+    // null says "I cannot see that from here", which is true.
+
+    it('reports null, not false, when the capability is absent', async () => {
+        const { renewabilityOf } = await import('../../index.js')
+        assert.equal(renewabilityOf(['api:update', 'drive:documents']), null)
+    })
+
+    it('still reports true when a token really does carry it', async () => {
+        // A static token whose operator listed it. Present means present —
+        // only ABSENT is unknowable, and absence is the normal case.
+        const { renewabilityOf } = await import('../../index.js')
+        assert.equal(renewabilityOf(['api:update', 'offline_access']), true)
+    })
+
+    it('reports null for a credential with no capability list at all', async () => {
+        const { renewabilityOf } = await import('../../index.js')
+        assert.equal(renewabilityOf(null), null)
+        assert.equal(renewabilityOf(undefined), null)
+        assert.equal(renewabilityOf([]), null)
+    })
+})
+
 describe('a write refuses BEFORE it lands on the wrong side of expiry', () => {
     // The reported failure: a token that died between a finished decision and
     // the write that would have applied it. A 401 at the gate is fine, nothing

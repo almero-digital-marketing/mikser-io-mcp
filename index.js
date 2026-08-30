@@ -775,6 +775,12 @@ const authContext = new AsyncLocalStorage()
 // guard reads the REAL store, and a mock would test the mock.
 export function authContextForTests() { return authContext }
 
+// Whether the caller can renew unattended: true, or null when unknowable.
+// Never false — see the reasoning at the call site. Exported for its test.
+export function renewabilityOf(capabilities) {
+    return capabilities?.includes?.('offline_access') ? true : null
+}
+
 // What mikser_ping can say about the caller's credential.
 //
 // A JWT carries `exp`; a static bearer token has no expiry to report and
@@ -820,22 +826,38 @@ function authStatus() {
         capabilities,
         expiresAt: new Date(expiresAt).toISOString(),
         secondsRemaining,
-        // What the caller should DO, which depends on whether unattended
-        // renewal is actually available to it.
+        // Whether THIS caller can renew unattended, or null when that is not
+        // knowable — which, for a token from mikser-io-auth, it is not.
         //
-        // `renewable` is reported rather than assumed: the authorization server
-        // grants offline_access alongside every refresh token, but only a
-        // client that kept one can act on it, and this side cannot see that. A
-        // client holding a refresh token renews and never reaches the cliff; a
-        // client that did not keep one still needs a human, and telling it
-        // otherwise would be worse than the old warning.
-        renewable: capabilities?.includes?.('offline_access') ?? null,
+        // This asked `capabilities.includes('offline_access')`, and that is
+        // always false by design: auth keeps offline_access out of the token
+        // claims deliberately, because it is a property of the grant rather
+        // than a capability, and a resource server checking capabilities must
+        // never see it or it becomes a permission nobody granted. It lives in
+        // the /token response scope instead, which this side never sees.
+        //
+        // So the field answered "you cannot renew" to every caller, including
+        // every one that could. That is the worst of the three possible
+        // answers: an agent reading `renewable: false` concludes it must stop
+        // and fetch a human, which is the exact outcome a refresh token exists
+        // to prevent — and it did, on a real deployment, where the reported
+        // symptom was a fixed one-hour window that never renewed.
+        //
+        // null means unknown and is honest. true is still reported if a token
+        // really does carry the capability — a static token whose operator
+        // listed it — but false is never asserted, because this side has no
+        // way to establish it. What the server knows and the note now says:
+        // renewal is offered, and whether the client kept its refresh token is
+        // the client's own business to answer.
+        renewable: renewabilityOf(capabilities),
         note: secondsRemaining < 300
-            ? 'Expires in under five minutes. If you hold a refresh token, exchange it now — the '
-              + 'server grants offline_access with every one it issues. Otherwise finish or '
-              + 're-authenticate before starting anything long.'
+            ? 'Expires in under five minutes. If you hold a refresh token, exchange it now — this '
+              + 'server issues one with every browser grant. Otherwise finish or re-authenticate '
+              + 'before starting anything long.'
             : 'Renew by exchanging your refresh token at any point; the window does not slide on '
-              + 'its own, so a long task should renew rather than race the deadline.',
+              + 'its own, so a long task should renew rather than race the deadline. `renewable` '
+              + 'is null because only you can know whether you kept the refresh token — the token '
+              + 'itself does not carry that fact.',
     }
 }
 
