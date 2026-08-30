@@ -211,10 +211,19 @@ function wrapMutatingHandler(handler) {
     return (args = {}, ...rest) => {
         const { changeSet, summary, ...toolArgs } = args ?? {}
         return withChangeSet(
-            // A set per call when the caller does not group, so a write is
-            // always attributable. An unattributed write is one nothing can
-            // ever take back.
-            { changeSet: changeSet ?? `cs-${randomUUID()}`, summary, principal: 'agent' },
+            {
+                // A set per call when the caller does not group, so a write is
+                // always attributable. An unattributed write is one nothing can
+                // ever take back.
+                changeSet: changeSet ?? `cs-${randomUUID()}`,
+                summary, principal: 'agent',
+                // An id minted here belongs to this call alone, so the request
+                // is over when the handler returns and the set can be committed
+                // at once rather than waiting out a batching window meant for
+                // human editing. An id the CALLER supplied exists precisely so
+                // more calls can join it, and only it knows when that stops.
+                closeOnReturn: !changeSet,
+            },
             () => handler(toolArgs, ...rest),
         )
     }
