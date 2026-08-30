@@ -245,7 +245,7 @@ function wrapMutatingHandler(handler) {
         // here so every mutating tool answers the same way, and only when the
         // set actually recorded something: an id for a call that wrote
         // nothing is a handle to nothing.
-        return attachChangeSet(result, id)
+        return await attachChangeSet(result, id)
     }
 }
 
@@ -266,8 +266,8 @@ function actingPrincipal() {
 
 // Fold the id into an MCP result's JSON text block, leaving anything else —
 // an image, an error, a non-JSON body — exactly as the tool produced it.
-function attachChangeSet(result, id) {
-    if (!findChangeSet(id)) return result
+async function attachChangeSet(result, id) {
+    if (!await findChangeSet(id)) return result
     const content = result?.content
     if (result?.isError || !Array.isArray(content)) return result
     return {
