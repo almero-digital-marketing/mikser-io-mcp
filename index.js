@@ -253,6 +253,8 @@ function wrapMutatingHandler(handler) {
 // or an unauthenticated endpoint — because "agent" is still truer there than
 // inventing a subject.
 function actingPrincipal() {
+    // The same store the substrate's own accessor reads, so the stamp and
+    // everything else agree about who is calling.
     const principal = authContext.getStore()?.principal
     if (!principal) return 'agent'
     const role = actingRole(principal.roles ?? [], runtime.options.roles?.catalogue ?? {})
@@ -520,6 +522,11 @@ export function createMcpSubstrate() {
             return {
                 subject: principal.subject ?? null,
                 capabilities: principal.capabilities ?? null,
+                // The groups the capabilities came from. Dropped here before,
+                // so every consumer reading the principal through this
+                // accessor — drive's refusals, the change-set stamp — saw a
+                // credential with no role and reported one with none.
+                roles: principal.roles ?? [],
                 expiresAt: principal.claims?.exp ? new Date(principal.claims.exp * 1000).toISOString() : null,
                 secondsRemaining: principal.claims?.exp
                     ? Math.max(0, Math.round(principal.claims.exp - Date.now() / 1000))
