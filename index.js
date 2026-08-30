@@ -1189,6 +1189,16 @@ function challenge(req, res, verifier, path, outcome) {
     if (verifier) res.set('WWW-Authenticate', `Bearer${errorParams(outcome)}`.replace(/^Bearer, /, 'Bearer '))
 }
 
+// Whether a request body opens a session. A batch counts if any member does:
+// a batch carrying an initialize is opening a session whatever else it holds.
+// GET and DELETE arrive with no body and are never initialize, which is right —
+// an SSE stream or a termination against a session that no longer exists is
+// exactly the case the 404 is for.
+function isInitializeRequest(body) {
+    if (Array.isArray(body)) return body.some(isInitializeRequest)
+    return body?.method === 'initialize'
+}
+
 function mountEndpoint(app, substrate, path, ep, endpointName) {
     const transports = new Map()
 
@@ -1260,6 +1270,40 @@ function mountEndpoint(app, substrate, path, ep, endpointName) {
             // handler the SDK dispatches to.
             return authContext.run({ principal: req.principal }, () =>
                 transports.get(sessionId).handleRequest(req, res, body))
+        }
+
+        // A session id we do not hold. `transports` is this process's memory,
+        // so a restart empties it while every connected client keeps the id it
+        // was given — one dependency update is enough to strand them all.
+        //
+        // 404 is the spec's answer and it is load-bearing: on 404 a client
+        // opens a new session with a fresh InitializeRequest, reusing the token
+        // it already holds. Nothing else about that client has expired — the
+        // access token is a JWT and still verifies, the dynamic registration is
+        // durable — so the reconnect is silent and needs no human.
+        //
+        // Falling through to the new-session branch instead treats an unknown
+        // id as no id at all, and those are opposite facts. The request is
+        // handed to a transport that has never been initialized, and the error
+        // the SDK then raises tells the client everything except the one thing
+        // that is true: the session is gone, open another. Observed cost of
+        // that silence on a real deployment — every restart severed every
+        // agent permanently, and the recovery clients did find was a whole new
+        // OAuth flow: 30 dynamic registrations accumulated for ONE human.
+        //
+        // An initialize is let through even with a stale id, because it is the
+        // request that opens a session anyway; refusing it would strand a
+        // client that resends its stored id out of habit.
+        if (sessionId && !isInitializeRequest(body)) {
+            runtime.engine?.logger?.debug(
+                'MCP unknown session %s at %s — 404 so the client re-initializes',
+                sessionId, path)
+            res.status(404).json({
+                jsonrpc: '2.0',
+                error: { code: -32001, message: 'Session not found' },
+                id: null,
+            })
+            return
         }
 
         // New session — server filtered for this endpoint's surface.

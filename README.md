@@ -168,6 +168,23 @@ Notes:
 - ChatGPT Developer mode + custom MCP connectors are **beta** and require a Plus / Pro / Business / Enterprise / Edu account.
 - Connectors don't auto-enable per chat — toggle on each new conversation.
 
+## Sessions and restarts
+
+Sessions live in the serving process. A restart — a dependency update, a
+config change, a deploy — ends every one of them, while connected clients keep
+the session id they were handed.
+
+A request carrying an id the process does not hold gets **404**, which is the
+signal the Streamable HTTP spec defines for exactly this: on 404 a client opens
+a new session with a fresh `InitializeRequest`. Nothing else about that client
+has expired — its access token is a JWT that still verifies, and its dynamic
+registration is durable — so a well-behaved client reconnects silently, with no
+human in the loop and no second trip through the authorization flow.
+
+An `initialize` is served even when it carries a stale id, so a client that
+resends its stored id out of habit still gets a session rather than looping on
+404.
+
 ## Documentation
 
 - [Full MCP tour, twelve worked scenarios, every tool and resource](./documentation/mcp.md)
