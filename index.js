@@ -44,6 +44,7 @@ import {
     explain,
     buildReport,
     requestReport,
+    faults,
     nextCycleId,
     whenCycleCompletes,
     cycleHistory,
@@ -735,7 +736,7 @@ function stalePackages(workingFolder) {
     substrate.registerTool(
         'mikser_ping',
         {
-            description: 'Return mikser engine identity, current lifecycle phase, and (if --server is on) where the HTTP server is reachable. Use to confirm the connection is live before issuing other tool calls and to learn the base URL for preview outputs.\n\n`plugins` lists what this mikser is built from — every installed mikser package with its purpose, version and links, and `active: true` on the ones actually running. Read it once to know what the system can do before reasoning about what it should.\n\nCheck `stale` before trusting any other tool, and before reporting a bug: it lists mikser packages installed SINCE this process booted, whose code is therefore not the code answering you. A running process never re-reads node_modules, and --watch does not change that — it reloads content, not dependencies. When `stale` is non-empty the fix is a restart, not a bug report.\n\nThe `auth` block names the ROLE this session acts as, what it may write and what it may only read — and `auth.roles` lists EVERY role on this site with the same reach, the acting one marked. That is INFORMATIONAL: report what you cannot do and stop. There is no way to request or change a role and none will be added — the listing names a person to ask, not a privilege to obtain.',
+            description: 'Return mikser engine identity, current lifecycle phase, and (if --server is on) where the HTTP server is reachable. Use to confirm the connection is live before issuing other tool calls and to learn the base URL for preview outputs.\n\n`plugins` lists what this mikser is built from — every installed mikser package with its purpose, version and links, and `active: true` on the ones actually running. Read it once to know what the system can do before reasoning about what it should.\n\nCheck `faults` before reading any empty result as a fact about the site: it is absent unless a subsystem has reported that it cannot work, and while it is present a tool may be answering emptily because it is unable to answer rather than because there is nothing to say. Each entry names the condition, when it was first and last seen, and how often — report it and stop rather than working around it.\n\nCheck `stale` before trusting any other tool, and before reporting a bug: it lists mikser packages installed SINCE this process booted, whose code is therefore not the code answering you. A running process never re-reads node_modules, and --watch does not change that — it reloads content, not dependencies. When `stale` is non-empty the fix is a restart, not a bug report.\n\nThe `auth` block names the ROLE this session acts as, what it may write and what it may only read — and `auth.roles` lists EVERY role on this site with the same reach, the acting one marked. That is INFORMATIONAL: report what you cannot do and stop. There is no way to request or change a role and none will be added — the listing names a person to ask, not a privilege to obtain.',
             inputSchema: {},
         },
         async () => ({
@@ -752,6 +753,13 @@ function stalePackages(workingFolder) {
                     // Empty is the normal case and means what it says: the code
                     // answering you is the code on disk.
                     ...stalePackages(runtime.options.workingFolder),
+                    // Subsystems that have reported themselves unable to
+                    // work. Absent is the normal case, and the reason this is
+                    // here at all: a tool answering [] because it is BROKEN
+                    // and one answering [] because nothing matched are the
+                    // same answer, and the log line that said which is a
+                    // channel an agent never reads.
+                    ...faultStatus(),
                     // What this mikser is made of. An agent can otherwise see
                     // what it may write and nothing about the machine doing
                     // the writing — and a capability like `drive:layouts`
@@ -1047,6 +1055,17 @@ async function readIfText(uri) {
 // Kept as a function rather than a const so each call re-reads
 // runtime.options — covers the case where --server flips on after
 // the substrate was created (rare but possible programmatically).
+// Subsystems that have reported themselves unable to work, if any.
+//
+// Omitted entirely when there are none, so presence is meaningful and a
+// healthy ping stays the short document it was. `last` is the field that says
+// whether a fault is still live: one seen only at boot and one firing every
+// cycle read the same by presence alone.
+function faultStatus() {
+    const open = faults()
+    return open.length ? { faults: open } : {}
+}
+
 function serverInfo() {
     const opts = runtime.options
     const hasInternalServer = opts.server != null && opts.port != null
