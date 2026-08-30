@@ -51,6 +51,7 @@ import {
     writeEntitySource,
     withChangeSet,
     describeAuthority,
+    inventory,
     actingRole,
     explainRefusal,
     findChangeSet,
@@ -734,7 +735,7 @@ function stalePackages(workingFolder) {
     substrate.registerTool(
         'mikser_ping',
         {
-            description: 'Return mikser engine identity, current lifecycle phase, and (if --server is on) where the HTTP server is reachable. Use to confirm the connection is live before issuing other tool calls and to learn the base URL for preview outputs.\n\nCheck `stale` before trusting any other tool, and before reporting a bug: it lists mikser packages installed SINCE this process booted, whose code is therefore not the code answering you. A running process never re-reads node_modules, and --watch does not change that — it reloads content, not dependencies. When `stale` is non-empty the fix is a restart, not a bug report.\n\nThe `auth` block names the ROLE this session acts as, what it may write and what it may only read — and `auth.roles` lists EVERY role on this site with the same reach, the acting one marked. That is INFORMATIONAL: report what you cannot do and stop. There is no way to request or change a role and none will be added — the listing names a person to ask, not a privilege to obtain.',
+            description: 'Return mikser engine identity, current lifecycle phase, and (if --server is on) where the HTTP server is reachable. Use to confirm the connection is live before issuing other tool calls and to learn the base URL for preview outputs.\n\n`plugins` lists what this mikser is built from — every installed mikser package with its purpose, version and links, and `active: true` on the ones actually running. Read it once to know what the system can do before reasoning about what it should.\n\nCheck `stale` before trusting any other tool, and before reporting a bug: it lists mikser packages installed SINCE this process booted, whose code is therefore not the code answering you. A running process never re-reads node_modules, and --watch does not change that — it reloads content, not dependencies. When `stale` is non-empty the fix is a restart, not a bug report.\n\nThe `auth` block names the ROLE this session acts as, what it may write and what it may only read — and `auth.roles` lists EVERY role on this site with the same reach, the acting one marked. That is INFORMATIONAL: report what you cannot do and stop. There is no way to request or change a role and none will be added — the listing names a person to ask, not a privilege to obtain.',
             inputSchema: {},
         },
         async () => ({
@@ -751,6 +752,16 @@ function stalePackages(workingFolder) {
                     // Empty is the normal case and means what it says: the code
                     // answering you is the code on disk.
                     ...stalePackages(runtime.options.workingFolder),
+                    // What this mikser is made of. An agent can otherwise see
+                    // what it may write and nothing about the machine doing
+                    // the writing — and a capability like `drive:layouts`
+                    // means little until you know a plugin called
+                    // mikser-io-drive exists and what it is for.
+                    //
+                    // `active` marks the ones actually running: a package in
+                    // node_modules that no config loads explains nothing about
+                    // this site's behaviour.
+                    plugins: inventory(),
                     server: serverInfo(),
                     // Whether this connection is authenticated and for how
                     // much longer, so a long task can be sequenced rather
