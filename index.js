@@ -49,6 +49,7 @@ import {
     cycleHistory,
     checksum as fileChecksumOf,
     writeEntitySource,
+    withChangeSet,
     deleteEntitySource,
     contentAdvisories,
     advisoryWarning,
@@ -187,6 +188,38 @@ export function zodShapeFrom(inputSchema = {}) {
 //
 // Detected by behaviour rather than by a flag: a zod type has safeParse, a
 // neutral spec is a plain object carrying `type`.
+// The two parameters every mutating tool gets, so a caller learns them once
+// rather than per tool.
+function withChangeSetParams(inputSchema) {
+    return {
+        ...(inputSchema ?? {}),
+        changeSet: z.string().optional().describe(
+            'Groups this with other changes into ONE undoable unit. Pass the SAME id for every tool call you make '
+            + 'while carrying out one request, so undoing it takes back the whole request rather than one file of '
+            + 'it. Omit and this call becomes its own change set.'),
+        summary: z.string().optional().describe(
+            'One line describing what this accomplishes, in the USER\'s terms — "change the hero text on the '
+            + 'devices page", not "write hero.yml". It becomes the commit subject and is what a person picks from '
+            + 'when choosing what to undo; nothing downstream can reconstruct it.'),
+    }
+}
+
+// Run the handler inside its change set, so every write underneath is
+// attributed — including writes by code that has never heard of change sets.
+function wrapMutatingHandler(handler) {
+    if (typeof handler !== 'function') return handler
+    return (args = {}, ...rest) => {
+        const { changeSet, summary, ...toolArgs } = args ?? {}
+        return withChangeSet(
+            // A set per call when the caller does not group, so a write is
+            // always attributable. An unattributed write is one nothing can
+            // ever take back.
+            { changeSet: changeSet ?? `cs-${randomUUID()}`, summary, principal: 'agent' },
+            () => handler(toolArgs, ...rest),
+        )
+    }
+}
+
 function normalizeInputSchema(inputSchema) {
     if (!inputSchema || typeof inputSchema !== 'object') return inputSchema
     const values = Object.values(inputSchema)
@@ -273,6 +306,15 @@ export function createMcpSubstrate() {
         // recorded args verbatim — substrate doesn't peek at the
         // shape, it just records and replays.
         registerTool(...args) {
+            // `mutates: true` in the definition is how a tool says it changes
+            // something. Handled HERE rather than in simpleTool because this
+            // is the primitive every registration path goes through —
+            // mikser-io-drive registers directly, and a flag that only worked
+            // on the convenience wrapper would silently do nothing for it.
+            if (args[1]?.mutates) {
+                args = [args[0], { ...args[1], inputSchema: withChangeSetParams(args[1].inputSchema) },
+                        wrapMutatingHandler(args[2])]
+            }
             if (args[1]?.inputSchema) {
                 args = [args[0], { ...args[1], inputSchema: normalizeInputSchema(args[1].inputSchema) }, args[2]]
             }
@@ -352,8 +394,19 @@ export function createMcpSubstrate() {
 
         // Convenience helper for the common case: 3-arg tool with
         // description and input schema.
-        simpleTool(name, description, inputSchema, handler) {
-            return substrate.registerTool(name, { description, inputSchema: normalizeInputSchema(inputSchema) }, handler)
+        //
+        // `mutates: true` is how a tool says it changes something. The
+        // substrate then adds `changeSet` and `summary` to its schema and runs
+        // the handler inside that change set, so every write underneath is
+        // attributed — including writes by code that has never heard of change
+        // sets, which is most of them.
+        //
+        // Declared once per tool rather than threaded through each write:
+        // a new mutating tool that forgets the plumbing is a tool whose edits
+        // silently cannot be undone, and that failure is invisible until
+        // someone tries.
+        simpleTool(name, description, inputSchema, handler, { mutates = false } = {}) {
+            return substrate.registerTool(name, { description, inputSchema, mutates }, handler)
         },
 
         // Create a fresh McpServer pre-loaded with every recorded
@@ -1732,6 +1785,7 @@ export function mcp(options = {}) {
                     return fail(err.message)
                 }
             },
+            { mutates: true },
         )
 
         try {
@@ -1943,10 +1997,8 @@ export function mcp(options = {}) {
                 ifChecksum:   z.string().optional().describe('Precondition: only write if the file\'s current DISK checksum equals this. Use `diskChecksum` from mikser_read_entity — its `checksum` is the catalog\'s, which lags the disk between builds and will be refused. On mismatch the write is refused and the disk `currentChecksum` is returned: re-apply your change and retry with that. Omit to write unconditionally.'),
                 await:        z.boolean().optional().describe('Block until the cycle that picks up this write completes, and return its build report as `report`. Slower, but answers "what did my edit change" in the same call.'),
                 dryRun:       z.boolean().optional().describe('Write NOTHING. Returns `wouldAffect` — every destination that would re-render, each with the same reason vocabulary the build report uses — plus any advisory on the file and any destination collision already standing at those outputs. Use before touching anything shared.'),
-                changeSet:    z.string().optional().describe('Groups this write with others into ONE undoable unit. Pass the SAME id for every file you touch while carrying out one request, so undoing it takes back the whole request rather than one file of it. Omit and each call becomes its own change set. Requires the git plugin to be durable; without it the id is recorded and unused.'),
-                summary:      z.string().optional().describe('One line describing what this change accomplishes, in the user\'s terms — "change the hero text on the devices page", not "write hero.yml". It becomes the commit subject and is what a person picks from when choosing what to undo, so nothing downstream can reconstruct it if you leave it out.'),
             },
-            async ({ id, collection, relativePath, content = '', ifChecksum, await: awaitCycle, dryRun, changeSet, summary }) => {
+            async ({ id, collection, relativePath, content = '', ifChecksum, await: awaitCycle, dryRun }) => {
                 try {
                     // Before the bytes move, not after. A dry run changes
                     // nothing, so it is never refused.
@@ -1963,11 +2015,6 @@ export function mcp(options = {}) {
                     // write, not of this transport.
                     const result = await writeEntitySource({
                         id, collection, relativePath, content, ifChecksum, dryRun, awaitCycle,
-                        // A set per call when the caller does not group, so a
-                        // write is always attributable — an unattributed write
-                        // is one nothing can ever take back.
-                        changeSet: changeSet ?? (dryRun ? undefined : `cs-${randomUUID()}`),
-                        summary, principal: 'agent',
                     })
 
                     // A refusal that names a bad request stays an error, so a
@@ -1991,6 +2038,7 @@ export function mcp(options = {}) {
                     return fail(err.message)
                 }
             },
+            { mutates: true },
         )
 
         mcp.simpleTool(
@@ -2008,10 +2056,8 @@ export function mcp(options = {}) {
                 relativePath: z.string().optional().describe('Path relative to the collection folder. Required unless `id` is given.'),
                 ifChecksum:   z.string().optional().describe('Precondition: only delete if the file\'s current DISK checksum equals this. Use `diskChecksum` from mikser_read_entity.'),
                 dryRun:       z.boolean().optional().describe('Delete NOTHING. Reports what references this and what would stop rendering.'),
-                changeSet:    z.string().optional().describe('Groups this delete with other writes into ONE undoable unit. Pass the same id you used for the writes that belong to the same request.'),
-                summary:      z.string().optional().describe('One line describing what this accomplishes, in the user\'s terms. Becomes the commit subject and is what a person picks from when choosing what to undo.'),
             },
-            async ({ id, collection, relativePath, ifChecksum, dryRun, changeSet, summary }) => {
+            async ({ id, collection, relativePath, ifChecksum, dryRun }) => {
                 try {
                     if (!dryRun) {
                         const refusal = refuseIfExpiringWithin(15, 'a delete')
@@ -2019,8 +2065,6 @@ export function mcp(options = {}) {
                     }
                     const result = await deleteEntitySource({
                         id, collection, relativePath, ifChecksum, dryRun,
-                        changeSet: changeSet ?? (dryRun ? undefined : `cs-${randomUUID()}`),
-                        summary, principal: 'agent',
                     })
                     // A stale checksum is a normal outcome carrying the value
                     // to retry with; every other refusal is a bad request.
@@ -2033,6 +2077,7 @@ export function mcp(options = {}) {
                     return fail(err.message)
                 }
             },
+            { mutates: true },
         )
 
         mcp.simpleTool(
@@ -2078,6 +2123,7 @@ export function mcp(options = {}) {
                     return fail(err.message)
                 }
             },
+            { mutates: true },
         )
 
         logger.debug('MCP tools registered: mikser_{query_entities,read_entity,update_entity,delete_entity,render} (mcp plugin)')
