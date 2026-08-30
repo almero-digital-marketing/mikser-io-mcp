@@ -525,3 +525,52 @@ describe('checksum guidance points somewhere reachable', () => {
         assert.match(src, /differsNote/, 'read_entity flags the divergence rather than hiding it')
     })
 })
+
+// Which tools advertise change sets, and why that is not "every tool that
+// does something".
+//
+// `mutates: true` promises the call can be taken back. Undo reverts SOURCE
+// files, so a tool that only produces output cannot honour that promise —
+// output is derived, sits outside the git plugin's `paths`, and a revert of
+// it would find nothing to revert. Marking such a tool would advertise an undo
+// that silently does nothing.
+describe('the mutates flag tracks source writes, not side effects', () => {
+    const source = () => readFile(new URL('../../index.js', import.meta.url), 'utf8')
+
+    const markedTools = async () => {
+        const lines = (await source()).split('\n')
+        const marked = []
+        for (let i = 0; i < lines.length; i++) {
+            if (!lines[i].includes('mutates: true')) continue
+            for (let j = i; j >= Math.max(0, i - 260); j--) {
+                const m = /'(mikser_[a-z_]+)',/.exec(lines[j])
+                if (m) { marked.push(m[1]); break }
+            }
+        }
+        return marked
+    }
+
+    it('marks the tools that write source files', async () => {
+        const marked = await markedTools()
+        for (const tool of ['mikser_update_entity', 'mikser_delete_entity', 'mikser_refs_rename']) {
+            assert.ok(marked.includes(tool), `${tool} writes source and must be undoable`)
+        }
+    })
+
+    it('does not mark render, which produces output rather than source', async () => {
+        // Neither `save: true` nor `save: false` reaches a source-writing
+        // primitive — the render path touches no useCollection().write and no
+        // writeEntity — so a change set here would record nothing whatever
+        // the argument said.
+        const marked = await markedTools()
+        assert.ok(!marked.includes('mikser_render'),
+            'render writes output, which undo does not and cannot cover')
+    })
+
+    it('says so in the tool description, where a caller will look', async () => {
+        const src = await source()
+        const at = src.indexOf("'mikser_render',")
+        assert.match(src.slice(at, at + 2000), /not undoable/,
+            'a caller must not have to infer the absence of a parameter')
+    })
+})

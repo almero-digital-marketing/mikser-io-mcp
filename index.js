@@ -2082,7 +2082,8 @@ export function mcp(options = {}) {
 
         mcp.simpleTool(
             'mikser_render',
-            'Render a transient entity through the engine pipeline (parse → layouts → resources → render → postprocess) and return the FINAL produced bytes. Use this for "preview this layout against this data" without writing the entity to disk. The returned bytes are the pipeline\'s final output — PDF for a `*.html-pdf.*` layout, MJML-derived HTML for `*.html-mjml.*`, etc. Set options.save=false to skip the disk write; options.catalog=false to prune the catalog row after rendering. For a clickable preview URL instead of raw bytes, use mikser_preview_render (preview plugin).',
+            'Render a transient entity through the engine pipeline (parse → layouts → resources → render → postprocess) and return the FINAL produced bytes. Use this for "preview this layout against this data" without writing the entity to disk. The returned bytes are the pipeline\'s final output — PDF for a `*.html-pdf.*` layout, MJML-derived HTML for `*.html-mjml.*`, etc. Set options.save=false to skip the disk write; options.catalog=false to prune the catalog row after rendering. For a clickable preview URL instead of raw bytes, use mikser_preview_render (preview plugin).\n\n'
+            + 'This produces OUTPUT, not source. It takes no `changeSet` and is not undoable: undo reverts source files, and output is derived — the next build regenerates it either way.',
             {
                 entity:  z.record(z.any()).describe('Entity shape with at least { id, collection } and any meta/content the renderer needs.'),
                 options: z.record(z.any()).optional().describe('Renderer options: { save: false, catalog: false, renderer: "...", postprocessor: "..." }.'),
@@ -2123,7 +2124,6 @@ export function mcp(options = {}) {
                     return fail(err.message)
                 }
             },
-            { mutates: true },
         )
 
         logger.debug('MCP tools registered: mikser_{query_entities,read_entity,update_entity,delete_entity,render} (mcp plugin)')
