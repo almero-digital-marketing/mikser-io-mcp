@@ -50,6 +50,7 @@ import {
     checksum as fileChecksumOf,
     writeEntitySource,
     withChangeSet,
+    findChangeSet,
     deleteEntitySource,
     contentAdvisories,
     advisoryWarning,
@@ -208,15 +209,15 @@ function withChangeSetParams(inputSchema) {
 // attributed — including writes by code that has never heard of change sets.
 function wrapMutatingHandler(handler) {
     if (typeof handler !== 'function') return handler
-    return (args = {}, ...rest) => {
+    return async (args = {}, ...rest) => {
         const { changeSet, summary, ...toolArgs } = args ?? {}
-        return withChangeSet(
+        // A set per call when the caller does not group, so a write is always
+        // attributable. An unattributed write is one nothing can ever take
+        // back.
+        const id = changeSet ?? `cs-${randomUUID()}`
+        const result = await withChangeSet(
             {
-                // A set per call when the caller does not group, so a write is
-                // always attributable. An unattributed write is one nothing can
-                // ever take back.
-                changeSet: changeSet ?? `cs-${randomUUID()}`,
-                summary, principal: 'agent',
+                changeSet: id, summary, principal: 'agent',
                 // An id minted here belongs to this call alone, so the request
                 // is over when the handler returns and the set can be committed
                 // at once rather than waiting out a batching window meant for
@@ -226,6 +227,33 @@ function wrapMutatingHandler(handler) {
             },
             () => handler(toolArgs, ...rest),
         )
+        // Report the id back, whatever shape the tool's own result takes.
+        //
+        // Each handler builds its own response, so a tool that never mentions
+        // change sets — mikser_drive_add — returned none, which made its
+        // writes look outside the mechanism when they were in it. Attached
+        // here so every mutating tool answers the same way, and only when the
+        // set actually recorded something: an id for a call that wrote
+        // nothing is a handle to nothing.
+        return attachChangeSet(result, id)
+    }
+}
+
+// Fold the id into an MCP result's JSON text block, leaving anything else —
+// an image, an error, a non-JSON body — exactly as the tool produced it.
+function attachChangeSet(result, id) {
+    if (!findChangeSet(id)) return result
+    const content = result?.content
+    if (result?.isError || !Array.isArray(content)) return result
+    return {
+        ...result,
+        content: content.map(part => {
+            if (part?.type !== 'text' || typeof part.text !== 'string') return part
+            let body
+            try { body = JSON.parse(part.text) } catch { return part }
+            if (!body || typeof body !== 'object' || Array.isArray(body) || body.changeSet) return part
+            return { ...part, text: JSON.stringify({ ...body, changeSet: id }, null, 2) }
+        }),
     }
 }
 
