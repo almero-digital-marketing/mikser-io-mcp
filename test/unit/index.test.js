@@ -1,11 +1,12 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { z } from 'zod'
 import { mkdtemp, mkdir, writeFile, rm, utimes, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import { createMcpSubstrate, wireLoggerToMcp } from '../../index.js'
-import { runtime, invokeTool, toolResultText, writeEntitySource } from 'mikser-io'
+import { runtime, invokeTool, toolResultText, writeEntitySource, registerTool } from 'mikser-io'
 
 // A minimal stand-in for @modelcontextprotocol/sdk's McpServer. We don't
 // want the tests to depend on a real transport / session — they verify
@@ -303,6 +304,54 @@ describe('endpoint filters (createServer with allowedTools / allowedResources)',
         // The SDK stores tools at server._registeredTools (object map).
         const toolNames = Object.keys(server._registeredTools)
         assert.deepEqual(toolNames.sort(), ['mikser_read_entity', 'mikser_update_entity'])
+    })
+
+    it('binds an engine-registered zod schema without flattening it', () => {
+        // A plugin registers against the ENGINE registry, not this substrate,
+        // and describes its parameters in zod. The core-import path used
+        // zodShapeFrom, which assumes the engine's NEUTRAL vocabulary — so a
+        // zod shape came through as a bag of optional strings. Every
+        // constraint dropped, nothing logged, and a tool that looked
+        // registered but refused nothing.
+        registerTool('zod_from_engine', {
+            description: 'd',
+            inputSchema: {
+                id: z.string(),
+                samples: z.number().int().min(0).max(10).optional(),
+            },
+        }, async () => ({}))
+
+        const substrate = createMcpSubstrate()
+        const server = substrate.createServer()
+        const bound = server._registeredTools['mikser_zod_from_engine']
+        assert.ok(bound, 'an engine-registered tool must reach a session')
+        // The number must still be a number. Flattened, it would be a string
+        // and this would pass.
+        assert.equal(bound.inputSchema.safeParse({ id: 'x', samples: 3 }).success, true)
+        assert.equal(bound.inputSchema.safeParse({ id: 'x', samples: 'three' }).success, false)
+        // And the required one must still be required.
+        assert.equal(bound.inputSchema.safeParse({ samples: 3 }).success, false)
+    })
+
+    it('gives an engine-registered mutating tool its change set', () => {
+        // `mutates: true` only reaches here because the engine registry keeps
+        // the whole definition. Without it the tool takes no changeSet and its
+        // writes are unattributable — the one failure nothing can repair after
+        // the fact.
+        registerTool('mutating_from_engine', {
+            description: 'd', inputSchema: { path: z.string() }, mutates: true,
+        }, async () => ({}))
+
+        const substrate = createMcpSubstrate()
+        const server = substrate.createServer()
+        const bound = server._registeredTools['mikser_mutating_from_engine']
+        assert.ok(bound, 'an engine-registered mutating tool must reach a session')
+        // zod strips what it does not declare, so a surviving changeSet is
+        // proof the parameter is actually there.
+        const parsed = bound.inputSchema.safeParse({ path: 'p', changeSet: 'cs-1', summary: 'why' })
+        assert.equal(parsed.success, true)
+        assert.equal(parsed.data.changeSet, 'cs-1')
+        assert.equal(parsed.data.summary, 'why')
     })
 
     it('allowedTools = "*" registers everything', () => {

@@ -7,7 +7,7 @@
 // the in-memory preview cache.
 //
 // The cache itself lives in mikser-io's preview plugin
-// (runtime.options.preview.{store, get, stats, config}). This module
+// (the `preview` service: {store, get, stats, config}). This module
 // reaches into it via that surface — no cross-plugin imports.
 
 import path from 'node:path'
@@ -15,7 +15,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { randomUUID, createHmac } from 'node:crypto'
 import { z } from 'zod'
-import { useRenderer, mimeForEntity, matchEntity } from 'mikser-io'
+import { useRenderer, mimeForEntity, matchEntity, useService } from 'mikser-io'
 
 // Resolve a path relative to this module's file. Used to find the
 // public/ folder regardless of where the package is installed (works
@@ -122,7 +122,7 @@ const PREVIEW_UI_SHELL_HTML = readFileSync(path.join(__dirname, "public", "previ
 // Plugin function — invoked by mikser-io-mcp/index.js's factory after
 // the substrate is set up. Registers the MCP-UI surface (shell + modes
 // resource + preview_ui + ui_action) AND the preview-render tool (which
-// reaches into runtime.options.preview for the cache).
+// asks core for the preview service).
 //
 // Not a default export plugin in the mikser sense — this is internal
 // composition. The mcp plugin's index.js is what mikser loads; this
@@ -135,15 +135,17 @@ export default ({
     findEntities,
 }) => {
     onLoaded(() => {
-        if (!runtime.options.mcp) return
-        const mcp = runtime.options.mcp
+        // Asked for from a hook, so every factory has run — including this
+        // package's own, which provides it.
+        const mcp = useService('mcp')
+        if (!mcp) return
         const { render: previewRender } = useRenderer(runtime, {
             defaultTimeout: runtime.config.preview?.renderTimeout ?? 30_000,
         })
 
         // mikser_preview_render — render an entity through the pipeline,
         // stash the bytes in the in-memory preview cache (provided by
-        // mikser-io core's preview plugin via runtime.options.preview),
+        // mikser-io core's preview plugin, offered as the `preview` service),
         // and return a clickable URL. Requires --server (or any
         // engine-supplied Express app) so the URL is reachable.
         mcp.simpleTool(
@@ -155,7 +157,7 @@ export default ({
             },
             async ({ entity = {}, options = {} }) => {
                 const logger = useLogger()
-                const preview = runtime.options.preview
+                const preview = useService('preview')
                 const ok = (data) => ({
                     content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
                 })
@@ -176,7 +178,7 @@ export default ({
                         return fail('mikser_preview_render requires either --url <public-url> or --server to be set so the preview URL is reachable. Use mikser_render to get raw bytes inline instead.')
                     }
                     if (!preview) {
-                        return fail('mikser_preview_render requires the preview cache. Ensure mikser-io core is loaded and runtime.options.preview is available.')
+                        return fail('mikser_preview_render requires the preview cache. Ensure the preview plugin from mikser-io core is in your plugins array.')
                     }
 
                     const cfg = preview.config()

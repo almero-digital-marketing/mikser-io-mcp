@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import previewPlugin from '../../preview.js'
 import { createHarness } from './plugin-harness.js'
+import { provideService, resetServices } from 'mikser-io'
 
 // A minimal MCP shim — captures simpleTool / registerTool / registerResource
 // calls so tests can invoke the handlers directly without booting the real MCP.
@@ -29,21 +30,24 @@ function fakeMcp() {
     }
 }
 
-// The preview plugin gates MCP tool registration on runtime.options.mcp.
-// We set it before invoking the plugin so the onLoaded hook registers
-// against our fake.
+// The preview plugin asks core for the 'mcp' service. We provide a fake
+// before invoking the plugin so its onLoaded registers against ours.
 function withMcp(harnessOptions = {}, entities = []) {
+    // A fresh fake per test, and the registry is module state: providing a
+    // second 'mcp' without clearing the first is (correctly) an error.
+    resetServices()
     const mcp = fakeMcp()
     const h = createHarness({
-        options: { ...harnessOptions, mcp, port: 3001 },
+        options: { ...harnessOptions, port: 3001 },
         entities,
     })
+    provideService('mcp', mcp)
     previewPlugin(h.core)
     return { h, mcp }
 }
 
 describe('preview plugin: mikser_preview_ui dispatch', () => {
-    it('registers mikser_preview_ui under MCP when runtime.options.mcp is set', async () => {
+    it('registers mikser_preview_ui under MCP when the mcp service is provided', async () => {
         const { h, mcp } = withMcp()
         await h.runHook('loaded')
         assert.ok(mcp.registered.has('mikser_preview_ui'),
@@ -86,8 +90,9 @@ describe('preview plugin: mikser_preview_ui dispatch', () => {
         assert.match(result.contents[0].text, /mikser_ui_action/, 'shell must relay clicks to mikser_ui_action')
     })
 
-    it('does NOT register when runtime.options.mcp is absent', async () => {
+    it('does NOT register when no mcp service is provided', async () => {
         const h = createHarness({ options: { port: 3001 } })
+        resetServices()
         previewPlugin(h.core)
         await h.runHook('loaded')
         // No MCP → no tool. Plugin still loads (route mount, cache available).

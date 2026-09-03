@@ -7,6 +7,7 @@ import path from 'node:path'
 import { runtime } from 'mikser-io'
 import { createHarness } from './plugin-harness.js'
 import { mcp, authContextForTests } from '../../index.js'
+import { useService } from 'mikser-io'
 
 // The tools an agent drives when it edits content are the ones that have to
 // answer honestly about disk: what a file currently holds, what is deployed
@@ -54,7 +55,7 @@ function bootPlugin() {
         registerPrompt() {},
         async sendLoggingMessage() {},
     }
-    runtime.options.mcp.attach(recorder)
+    useService('mcp').attach(recorder)
     return { harness, recorder }
 }
 

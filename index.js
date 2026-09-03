@@ -1,5 +1,5 @@
 // MCP substrate for mikser-io. The mcp plugin exposes
-// `runtime.options.mcp` (a substrate object) at factory time so other
+// the 'mcp' service (a substrate object) at factory time so other
 // plugins can register tools / resources / prompts against it at their
 // onLoaded hook with the same shape as the SDK's McpServer.
 //
@@ -63,6 +63,8 @@ import {
     useProvenance,
     sourcesBehind,
     sourcesOf,
+    provideService,
+    useService,
     registerTool as coreRegisterTool,
     toolNames as coreToolNames,
     toolSchema as coreToolSchema,
@@ -259,7 +261,7 @@ function actingPrincipal() {
     // everything else agree about who is calling.
     const principal = authContext.getStore()?.principal
     if (!principal) return 'agent'
-    const role = actingRole(principal.roles ?? [], runtime.options.roles?.catalogue ?? {})
+    const role = actingRole(principal.roles ?? [], useService('roles')?.catalogue ?? {})
     const subject = principal.subject ?? 'agent'
     return role ? `${subject} (${role})` : subject
 }
@@ -333,11 +335,24 @@ export function createMcpSubstrate() {
             const schema = coreToolSchema(name)
             if (!schema) continue
             try {
-                server.registerTool(
-                    exposed,
-                    { description: schema.description, inputSchema: zodShapeFrom(schema.inputSchema) },
-                    (args) => coreInvokeTool(name, args),
-                )
+                // normalizeInputSchema, not zodShapeFrom: a plugin registering
+                // against the engine may describe its parameters EITHER in the
+                // engine's neutral vocabulary or in zod. zodShapeFrom assumes
+                // neutral, so a real zod shape came through it as a bag of
+                // optional strings — every constraint dropped, no error, and a
+                // tool that looked registered but refused nothing.
+                let inputSchema = normalizeInputSchema(schema.inputSchema)
+                let handler = (args) => coreInvokeTool(name, args)
+                // `mutates: true` reaches here now that the engine registry
+                // carries the whole definition. Without this a mutating tool
+                // registered against the engine would take no changeSet, and
+                // its writes would be unattributable — the one failure nothing
+                // downstream can repair.
+                if (schema.mutates) {
+                    inputSchema = withChangeSetParams(inputSchema)
+                    handler = wrapMutatingHandler(handler)
+                }
+                server.registerTool(exposed, { description: schema.description, inputSchema }, handler)
                 bound.tools++
             } catch (err) {
                 runtime.engine?.logger?.debug(
@@ -828,8 +843,8 @@ function authStatus() {
     const authority = describeAuthority({
         capabilities: principal.capabilities,
         roles: principal.roles ?? [],
-        catalogue: runtime.options.roles?.catalogue ?? {},
-        summaries: runtime.options.roles?.summaries ?? {},
+        catalogue: useService('roles')?.catalogue ?? {},
+        summaries: useService('roles')?.summaries ?? {},
     })
     const exp = principal.claims?.exp
     if (!exp) {
@@ -1497,7 +1512,7 @@ function pinoLevelNumber(name) {
 //
 // The factory creates the substrate SYNCHRONOUSLY so other plugins
 // listed AFTER 'mcp' in the array can register tools/resources at
-// their own onLoaded hook with `if (!runtime.options.mcp) return`
+// their own onLoaded hook by asking core for the 'mcp' service
 // gating already in place from the in-core era. The plugin MUST be
 // FIRST in the user's plugins array — that's a documented invariant
 // in this repo's README.
@@ -1539,12 +1554,19 @@ export function mcp(options = {}) {
         add(runtime.options.corsExposeHeaders, ['mcp-session-id', 'mcp-protocol-version'])
     }
 
-    // Create substrate synchronously. Other plugins' factories /
-    // onLoaded hooks check `if (!runtime.options.mcp) return` before
-    // calling `mcp.simpleTool(...)` — so the substrate has to be on
-    // runtime.options.mcp by the time those run. The mcp plugin MUST
-    // be FIRST in the user's plugins array for that contract to hold.
-    runtime.options.mcp = createMcpSubstrate()
+    // Offered as a service rather than assigned to runtime.options.mcp.
+    //
+    // Tools do not need this at all any more — a plugin registers those
+    // against the engine's registry and this package binds them into each
+    // session. What is left is genuinely MCP's: resources and prompts, which
+    // core deliberately has no vocabulary for.
+    //
+    // A consumer asks core for it from a hook, by which time every factory
+    // has run — which retires the rule this comment used to carry, that the
+    // mcp plugin MUST be FIRST in the user's plugins array. Nothing enforced
+    // that; put it second and the tools silently vanished.
+    const substrate = createMcpSubstrate()
+    provideService('mcp', substrate, { plugin: 'mikser-io-mcp' })
     // mikser_build_report needs the cycle recorded, and recording is off
     // unless a reader asks for it — see report.js requestReport.
     requestReport()
@@ -1565,7 +1587,7 @@ export function mcp(options = {}) {
         // reference (held by plugins, render workers, useLogger
         // consumers) gains the side-channel automatically.
         if (runtime.engine?.logger) {
-            wireLoggerToMcp(runtime.engine.logger, runtime.options.mcp)
+            wireLoggerToMcp(runtime.engine.logger, substrate)
             logger.debug('MCP logger wiring active')
         }
 
@@ -1575,7 +1597,7 @@ export function mcp(options = {}) {
         if (runtime.options.app && runtime.options.mcpPath) {
             await mountMcpOnExpress(
                 runtime.options.app,
-                runtime.options.mcp,
+                substrate,
                 runtime.options.mcpPath,
             )
         }
@@ -1590,7 +1612,7 @@ export function mcp(options = {}) {
     // are silently skipped.
     onLoaded(() => {
         const logger = useLogger()
-        const mcp = runtime.options.mcp
+        const mcp = substrate
         if (!runtime.refs) {
             logger.debug('mikser_refs_* tools skipped: runtime.refs not initialized')
             return
@@ -1995,7 +2017,7 @@ export function mcp(options = {}) {
     })
 
     // mikser_layouts_inspect moved out — registered by mikser-io-layouts
-    // directly against `runtime.options.mcp`, same pattern vector and
+    // directly against the substrate, same pattern vector and
     // schemas use. Domain-owned tools live with the domain plugin; mcp
     // is registry + transport, not a tool catalog.
 
@@ -2017,7 +2039,7 @@ export function mcp(options = {}) {
     //
     onLoaded(() => {
         const logger = useLogger()
-        const mcp = runtime.options.mcp
+        const mcp = substrate
 
         const { render: mcpRender } = useRenderer(runtime, {
             defaultTimeout: options.renderTimeout ?? 30_000,
