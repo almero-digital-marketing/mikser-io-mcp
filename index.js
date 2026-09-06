@@ -50,6 +50,7 @@ import {
     cycleHistory,
     checksum as fileChecksumOf,
     writeEntitySource,
+    editEntitySource,
     withChangeSet,
     withPrincipal,
     describeAuthority,
@@ -2191,7 +2192,8 @@ export function mcp(options = {}) {
 
         mcp.simpleTool(
             'mikser_update_entity',
-            'Create or update a content file inside a mikser collection. Writes the WHOLE file — there is no partial-edit or patch mode, so send the complete intended contents. The file lands on disk and the next lifecycle cycle picks it up.\n\n'
+            'Create or update a content file inside a mikser collection. Writes the WHOLE file: send the complete intended contents, because anything you leave out is deleted.\n\n'
+            + 'Use this to CREATE a file, or when you are rewriting most of one. To change part of an existing file use mikser_edit_entity instead — it changes only the text you name, so a long file cannot lose a line you did not mean to touch.\n\n'
             + 'Pass `ifChecksum` with the checksum you got from mikser_read_entity to make the write conditional: if the file has changed since you read it the write is REFUSED and the response carries `currentChecksum`, so a blind whole-file rewrite cannot silently discard someone else\'s edit. Without it the write is unconditional.\n\n'
             + 'The response returns the resulting `checksum` (pass it as the next `ifChecksum`), the `cycleId` your write will be picked up by, and `siblingDestinations` when another file could render to the same place (e.g. index.md beside index.yml — whichever renders last wins and the other output is discarded).\n\n'
             + 'Pass `await: true` to block until that cycle finishes and get its build report back, so one call tells you what your edit invalidated instead of writing and guessing.',
@@ -2241,6 +2243,69 @@ export function mcp(options = {}) {
                     return ok(result)
                 } catch (err) {
                     logger.error('MCP mikser_update_entity error: %s', err.message)
+                    return fail(err.message)
+                }
+            },
+            { mutates: true },
+        )
+
+        mcp.simpleTool(
+            'mikser_edit_entity',
+            'Change PART of an existing content file, by naming the text to change. Everything you do not name is '
+            + 'left exactly as it is — byte for byte, including whitespace, line endings and anything further down '
+            + 'the file you never read.\n\n'
+            + 'Prefer this over mikser_update_entity for any change to an existing file. A whole-file write makes you '
+            + 're-emit the entire document to change one line, and a line dropped on the way looks downstream exactly '
+            + 'like a line someone deleted on purpose.\n\n'
+            + '`find` must appear EXACTLY ONCE. If it appears more than once the edit is refused and the response '
+            + 'says how many times: extend `find` with the surrounding lines until it is unique, or pass `all: true` '
+            + 'to change every occurrence. If it appears nowhere the edit is refused too — the file is not what you '
+            + 'read, so re-read it rather than guessing.\n\n'
+            + 'The result must also still PARSE in the file\'s format (YAML frontmatter, a .yml data file, whatever '
+            + 'the site has registered). If it would not, nothing is written and the response carries the parser\'s '
+            + 'complaint. This is the check a whole-file write cannot offer.\n\n'
+            + 'Copy `find` from mikser_read_entity output verbatim, including indentation. An anchor assembled from '
+            + 'memory is the usual reason for a refusal.',
+            {
+                id:           z.string().optional().describe('Catalog id of the entity to edit (e.g. "/blog/launch.md"). Alternative to collection + relativePath.'),
+                collection:   z.string().optional().describe('Collection name (e.g. "documents"). Required unless `id` is given.'),
+                relativePath: z.string().optional().describe('Path relative to the collection folder. Required unless `id` is given.'),
+                find:         z.string().describe('The EXACT text to replace, copied from the file. Must match once (or pass `all`). Include enough surrounding lines to be unique — a bare word usually is not.'),
+                replace:      z.string().optional().describe('The text to put in its place. Omit or pass "" to DELETE the matched text. Match the surrounding indentation; nothing reindents it for you.'),
+                all:          z.boolean().optional().describe('Replace every occurrence instead of refusing an ambiguous one. Use for a rename that really should hit all of them; the response reports `replacements`.'),
+                ifChecksum:   z.string().optional().describe('Precondition: only edit if the file\'s current DISK checksum equals this. Use `diskChecksum` from mikser_read_entity. Optional here — the anchor is itself a check on the file being what you read.'),
+                await:        z.boolean().optional().describe('Block until the cycle that picks up this edit completes, and return its build report as `report`.'),
+                dryRun:       z.boolean().optional().describe('Write NOTHING, but still resolve the anchor: refusals are reported exactly as they would be. Returns `wouldAffect` — every destination that would re-render.'),
+            },
+            async ({ id, collection, relativePath, find, replace = '', all, ifChecksum, await: awaitCycle, dryRun }) => {
+                try {
+                    if (!dryRun) {
+                        const refusal = refuseIfExpiringWithin(
+                            awaitCycle ? 120 : 15,
+                            awaitCycle ? 'an edit that then waits for a build cycle' : 'an edit')
+                        if (refusal) return refusal
+                    }
+
+                    const result = await editEntitySource({
+                        id, collection, relativePath, find, replace, all, ifChecksum, dryRun, awaitCycle,
+                    })
+
+                    // The anchor refusals are NOT errors. Each one carries what
+                    // the next attempt needs — the occurrence count, the
+                    // parser's complaint, the current checksum — and an error
+                    // string is where that goes to die. A caller that gets
+                    // `refused: 'anchor-ambiguous'` with `occurrences: 4` can
+                    // fix its own anchor; one that gets a red failure retries
+                    // the same call or falls back to rewriting the whole file,
+                    // which is the outcome this tool exists to avoid.
+                    const recoverable = ['anchor-not-found', 'anchor-ambiguous',
+                                         'would-not-parse', 'checksum-mismatch']
+                    if (!result.ok && !recoverable.includes(result.refused)) {
+                        return fail(result.error ?? result.refused)
+                    }
+                    return ok(result)
+                } catch (err) {
+                    logger.error('MCP mikser_edit_entity error: %s', err.message)
                     return fail(err.message)
                 }
             },

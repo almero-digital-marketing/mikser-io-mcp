@@ -7,7 +7,7 @@ MCP (Model Context Protocol) substrate and tools for [mikser-io](https://github.
 - **The MCP substrate** — `createMcpSubstrate`, per-session McpServer + transport via `mountMcpOnExpress`, the pino-to-MCP log bridge `wireLoggerToMcp`. Other plugins compose against `runtime.options.mcp` to register their own tools and resources.
 - **Built-in resources** — `mikser://config`, `mikser://lifecycle`, `mikser://logs`, `mikser://server`. Read-only introspection any MCP client can use.
 - **Built-in tools**
-  - *Catalog* — `mikser_query_entities`, `mikser_read_entity`, `mikser_update_entity`, `mikser_delete_entity`, `mikser_render`, over the engine's public catalog API.
+  - *Catalog* — `mikser_query_entities`, `mikser_read_entity`, `mikser_edit_entity`, `mikser_update_entity`, `mikser_delete_entity`, `mikser_render`, over the engine's public catalog API.
   - *Finding things* — `mikser_search` locates a string across entity meta, source files, and (with `in: ["output"]`) the BUILT files, reporting occurrences per page — and with `attribute: true`, which source emitted each hit. That is how you find content you can only describe by what it says, and how you size a change to anything shared before making it.
   - *Working backwards* — `mikser_which` takes a built destination and returns the source that produced it: the field path and line/column a value was written at, or the line in file content where it appears — each occurrence flagged by whether the string BEGINS its line, which separates a declaration from a use in any text format without a per-language grammar. Each answer is labelled by how it was reached — `meta-field` and `source-content` are RECORDED (the engine's own `refClosure` says this render consumed that entity, and the position comes from parsing its source), `scan` is not. It reaches values that appear nowhere in a page's own document, which is most of a shared nav or footer.
   - *References* — `mikser_refs_inbound` / `mikser_refs_outbound` / `mikser_refs_broken` / `mikser_refs_rename`, from `runtime.refs`.
@@ -40,8 +40,36 @@ piping into `jq` works; exit status is 0 / 1 (the tool reported an error) /
 
 ## Editing content
 
-`mikser_update_entity` writes the WHOLE file — there is no partial-edit or
-patch mode. Three fields make that safe to do without a shell on the box:
+Two tools write source files, and which one you reach for is the whole point.
+
+`mikser_edit_entity` changes PART of a file: you name the text to replace and
+everything else is left exactly as it is, byte for byte. Use it for any change
+to an existing file.
+
+```js
+await mikser_edit_entity({
+    id: '/documents/pricing.md',
+    find: 'price: 1200',        // must match exactly once
+    replace: 'price: 1400',
+})
+```
+
+`find` must appear exactly once, or the edit is refused and told how many times
+it appeared — extend it with the surrounding lines, or pass `all: true` for a
+rename that really should hit every one. An anchor that appears nowhere is
+refused too: the file is not what you read. And the RESULT must still parse in
+the file's format — a broken YAML block is caught before it lands, which is the
+check a whole-file write has no way to make. None of those come back as
+errors; each is a result carrying what the next attempt needs.
+
+This exists because rewriting a whole file to change one line means re-emitting
+every other line, and a line dropped on the way looks downstream exactly like a
+line someone deleted on purpose. `ifChecksum` catches a stale read; nothing
+catches a lossy write.
+
+`mikser_update_entity` writes the WHOLE file. Use it to CREATE a file, or when
+you are genuinely replacing most of one. Three fields make that safe to do
+without a shell on the box:
 
 ```js
 const page = await mikser_read_entity({ id: '/styles/tokens/buttons.css', include: ['content', 'positions'] })

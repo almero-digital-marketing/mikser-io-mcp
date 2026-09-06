@@ -199,7 +199,8 @@ Tool ownership follows the plugin that owns the concept. Core ships one tool (th
 | --------------------- | ------------------------------------------------------------------------------------- |
 | `mikser_query_entities`| Paginated list of catalog entities with sift-compatible filter, sort, projection.     |
 | `mikser_read_entity`  | Read one entity by id. Pass `include: ["content"]` to also fetch the source file (text formats only). |
-| `mikser_update_entity`| Write/overwrite a content file inside a collection. Triggers a new lifecycle cycle.   |
+| `mikser_edit_entity`  | Change PART of a file by naming the text to replace; everything else is left byte for byte. Refuses an anchor that is not unique, and a result that would not parse. Prefer this for any change to an existing file. |
+| `mikser_update_entity`| Write/overwrite a content file inside a collection — the WHOLE file. For creating one, or replacing most of one. Triggers a new lifecycle cycle. |
 | `mikser_delete_entity`| Remove a content file from a collection.                                              |
 | `mikser_render`       | Render a transient entity through the full pipeline and return the produced bytes.    |
 
@@ -470,7 +471,7 @@ mcpUi:
 </script>
 ```
 
-Note the diff-on-submit: the layout sends only the fields the user actually changed. The agent's next step is `mikser_update_entity({ id: entityId, patch: payload.seo })` — surgical writes, no clobbering.
+Note the diff-on-submit: the layout sends only the fields the user actually changed. The agent's next step is one `mikser_edit_entity` call per changed field — `{ id: entityId, find: 'description: old text', replace: 'description: new text' }` — so the fields the user did not touch are not rewritten at all.
 
 #### 5. Multi-select picker — tags (Eta)
 
