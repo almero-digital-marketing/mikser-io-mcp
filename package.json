@@ -42,11 +42,11 @@
     "minimatch": "^10.0.3"
   },
   "peerDependencies": {
-    "mikser-io": "^10.0.0",
+    "mikser-io": "^10.14.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {
-    "mikser-io": "^10.0.0",
+    "mikser-io": "^10.14.0",
     "zod": "^4.0.0"
   }
 }
