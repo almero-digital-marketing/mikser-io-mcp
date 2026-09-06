@@ -55,6 +55,7 @@ import {
     withPrincipal,
     describeAuthority,
     inventory,
+    loadedPlugins,
     actingRole,
     explainRefusal,
     findChangeSet,
@@ -760,7 +761,7 @@ function stalePackages(workingFolder) {
     substrate.registerTool(
         'mikser_ping',
         {
-            description: 'Return mikser engine identity, current lifecycle phase, and (if --server is on) where the HTTP server is reachable. Use to confirm the connection is live before issuing other tool calls and to learn the base URL for preview outputs.\n\n`plugins` lists what this mikser is built from — every installed mikser package with its purpose, version and links, and `active: true` on the ones actually running. Read it once to know what the system can do before reasoning about what it should.\n\nCheck `faults` before reading any empty result as a fact about the site: it is absent unless a subsystem has reported that it cannot work, and while it is present a tool may be answering emptily because it is unable to answer rather than because there is nothing to say. Each entry names the condition, when it was first and last seen, and how often — report it and stop rather than working around it.\n\nCheck `stale` before trusting any other tool, and before reporting a bug: it lists mikser packages installed SINCE this process booted, whose code is therefore not the code answering you. A running process never re-reads node_modules, and --watch does not change that — it reloads content, not dependencies. When `stale` is non-empty the fix is a restart, not a bug report.\n\nThe `auth` block names the ROLE this session acts as, what it may write and what it may only read — and `auth.roles` lists EVERY role on this site with the same reach, the acting one marked. That is INFORMATIONAL: report what you cannot do and stop. There is no way to request or change a role and none will be added — the listing names a person to ask, not a privilege to obtain.',
+            description: 'Return mikser engine identity, current lifecycle phase, and (if --server is on) where the HTTP server is reachable. Use to confirm the connection is live before issuing other tool calls and to learn the base URL for preview outputs.\n\n`loaded` is what this runtime is actually RUNNING — recorded as each plugin loads, not worked out afterwards from what it happens to expose. Every loaded plugin is in it. `package` names the one it came from; `package: null` means the plugin is running and did not say what it is, which is NOT the same as not running and must not be read as it. Nothing is ever missing from this list because it could not be detected.\n\n`installed` is a different question: every mikser package on disk with its purpose, version and links — what the site COULD use, including what it is not using. A package in `installed` and absent from `loaded` is not loaded.\n\nRead `loaded` to know what the system does, and `installed` to know what it could do. Earlier versions merged the two into one list with an `active` flag whose absence meant either \'not running\' or \'could not tell\' — it reported git sync and schema validation as off while both were running.\n\nCheck `faults` before reading any empty result as a fact about the site: it is absent unless a subsystem has reported that it cannot work, and while it is present a tool may be answering emptily because it is unable to answer rather than because there is nothing to say. Each entry names the condition, when it was first and last seen, and how often — report it and stop rather than working around it.\n\nCheck `stale` before trusting any other tool, and before reporting a bug: it lists mikser packages installed SINCE this process booted, whose code is therefore not the code answering you. A running process never re-reads node_modules, and --watch does not change that — it reloads content, not dependencies. When `stale` is non-empty the fix is a restart, not a bug report.\n\nThe `auth` block names the ROLE this session acts as, what it may write and what it may only read — and `auth.roles` lists EVERY role on this site with the same reach, the acting one marked. That is INFORMATIONAL: report what you cannot do and stop. There is no way to request or change a role and none will be added — the listing names a person to ask, not a privilege to obtain.',
             inputSchema: {},
         },
         async () => ({
@@ -793,7 +794,8 @@ function stalePackages(workingFolder) {
                     // `active` marks the ones actually running: a package in
                     // node_modules that no config loads explains nothing about
                     // this site's behaviour.
-                    plugins: inventory(),
+                    loaded: loadedPlugins(),
+                    installed: inventory(),
                     server: serverInfo(),
                     // Whether this connection is authenticated and for how
                     // much longer, so a long task can be sequenced rather
