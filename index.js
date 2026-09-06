@@ -51,6 +51,7 @@ import {
     checksum as fileChecksumOf,
     writeEntitySource,
     withChangeSet,
+    withPrincipal,
     describeAuthority,
     inventory,
     actingRole,
@@ -237,7 +238,14 @@ function wrapMutatingHandler(handler) {
                 // more calls can join it, and only it knows when that stops.
                 closeOnReturn: !changeSet,
             },
-            () => handler(toolArgs, ...rest),
+            // The REAL principal, alongside the display string above. Those
+            // are two different things and the difference matters: the string
+            // is for the log, and asking `hasCapability` about it reads
+            // `undefined.capabilities`, takes the not-capability-scoped
+            // branch, and returns true for everything. Establishing the
+            // object is what lets the write primitives refuse.
+            () => withPrincipal(authContext.getStore()?.principal ?? null,
+                () => handler(toolArgs, ...rest)),
         )
         // Report the id back, whatever shape the tool's own result takes.
         //
