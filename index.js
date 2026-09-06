@@ -2402,6 +2402,6 @@ export function mcp(options = {}) {
         logger.debug('MCP tools registered: mikser_{query_entities,read_entity,update_entity,delete_entity,render} (mcp plugin)')
     })
 
-    return { name: 'mcp' }
+    return { name: 'mcp', module: import.meta.url }
     }
 }
