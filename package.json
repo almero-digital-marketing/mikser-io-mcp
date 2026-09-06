@@ -1,6 +1,6 @@
 {
   "name": "mikser-io-mcp",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "MCP (Model Context Protocol) substrate and tools for mikser-io. Extracted from core to iterate on its own release cadence.",
   "main": "index.js",
   "type": "module",
