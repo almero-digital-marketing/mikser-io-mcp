@@ -314,6 +314,10 @@ export default ({
                         // Spec-required: tells MCP Apps hosts to render
                         // this tool's result inside the shell iframe.
                         resourceUri: 'ui://mikser/preview-ui-shell',
+                        // Both, and stated rather than left to a host's
+                        // default: the model calls this tool, and the app is
+                        // what renders what comes back.
+                        visibility: ['model', 'app'],
                     },
                 },
             },
@@ -408,8 +412,14 @@ export default ({
                         // text — the layout's body HTML — so the user
                         // at least sees the rendered content even if
                         // the iframe doesn't load.
+                        // No `mimeType` here: MCP's TextContent has no such
+                        // field, so the SDK dropped it on the way out — the
+                        // wire showed a bare text block. It read like the
+                        // block was typed and was not; the type information
+                        // that matters lives on the ui:// resource and in the
+                        // extension declaration at initialize.
                         content: [
-                            { type: 'text', text: html, mimeType: 'text/html' },
+                            { type: 'text', text: html },
                         ],
                         // structuredContent — the spec-mandated way to
                         // deliver per-call data to a UI tool's iframe.

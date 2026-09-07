@@ -83,6 +83,16 @@ import { readFile as readFileAsync, stat as statAsync, readdir as readdirAsync }
 import packageInfo from 'mikser-io/package.json' with { type: 'json' }
 import previewPlugin from './preview.js'
 
+// The MCP Apps extension id, per SEP-1865. Both sides name it in
+// `capabilities.extensions` at initialize, and a conformant host renders a
+// tool's ui:// template ONLY if the server declared it — which is why
+// everything else being right (the ui:// resource at
+// `text/html;profile=mcp-app`, `_meta.ui.resourceUri` on the tool,
+// structuredContent, the shell's ui/notifications/tool-result listener) still
+// produced a text block in every host: the handshake never said UI was on
+// offer, so no host had reason to ask for it.
+const UI_EXTENSION = 'io.modelcontextprotocol/ui'
+
 // The mikser mark, offered two ways.
 //
 // MCP's Implementation carries `icons`, and a client with none falls back to
@@ -323,10 +333,20 @@ export function createMcpSubstrate() {
     function bind(server, filters = {}) {
         const { allowedTools, allowedResources, allowedPrompts } = filters
         const bound = { tools: 0, resources: 0, prompts: 0 }
+        // What the MCP Apps extension would be declared over, collected
+        // from what actually got bound rather than from a constant: an
+        // endpoint whose allowedTools filter drops the UI tool, or whose
+        // allowedResources drops the shell, must not advertise UI it
+        // cannot serve. See declareUiExtension below.
+        const uiTemplatesWanted = new Set()
+        const uiTemplatesBound  = new Set()
+        const uiMimeTypes       = new Set()
         const ownNames = new Set(registrations.tools.map(([name]) => name))
         for (const args of registrations.tools) {
             if (!matchesAny(args[0], allowedTools)) continue
             server.registerTool(...args)
+            const template = args[1]?._meta?.ui?.resourceUri
+            if (typeof template === 'string') uiTemplatesWanted.add(template)
             bound.tools++
         }
         // Tools registered directly against the ENGINE — its own diagnostics,
@@ -376,6 +396,14 @@ export function createMcpSubstrate() {
             // target than the short `mikser-lifecycle` name).
             const uri = typeof args[1] === 'string' ? args[1] : args[0]
             if (!matchesAny(uri, allowedResources)) continue
+            if (typeof uri === 'string' && uri.startsWith('ui://')) {
+                uiTemplatesBound.add(uri)
+                // The mime type is the resource's own declaration — the
+                // extension advertises what the templates ARE, so adding a
+                // second UI content type later needs no edit here.
+                const mimeType = args[2]?.mimeType
+                if (typeof mimeType === 'string') uiMimeTypes.add(mimeType)
+            }
             server.registerResource(...args)
             bound.resources++
         }
@@ -383,6 +411,13 @@ export function createMcpSubstrate() {
             if (!matchesAny(args[0], allowedPrompts)) continue
             server.registerPrompt(...args)
             bound.prompts++
+        }
+        // A tool's template is only usable if the resource carrying it got
+        // bound too. Advertising the extension on the strength of the tool
+        // alone points a host at a ui:// it will fetch and not find.
+        bound.ui = {
+            templates: [...uiTemplatesWanted].filter(uri => uiTemplatesBound.has(uri)),
+            mimeTypes: [...uiMimeTypes].sort(),
         }
         return bound
     }
@@ -511,6 +546,13 @@ export function createMcpSubstrate() {
                 { capabilities: { tools: {}, resources: {}, logging: {} } },
             )
             const bound = bind(server, { allowedTools, allowedResources, allowedPrompts })
+            // Before connect, per the SDK — registerCapabilities throws once a
+            // transport is attached, and this runs per session at mount time.
+            if (bound.ui?.templates.length && bound.ui.mimeTypes.length) {
+                server.server.registerCapabilities({
+                    extensions: { [UI_EXTENSION]: { mimeTypes: bound.ui.mimeTypes } },
+                })
+            }
             runtime.engine?.logger?.debug(
                 'MCP session server created (tools=%d/%d, resources=%d/%d, prompts=%d/%d)',
                 bound.tools, registrations.tools.length,

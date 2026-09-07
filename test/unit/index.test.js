@@ -623,3 +623,83 @@ describe('the mutates flag tracks source writes, not side effects', () => {
             'a caller must not have to infer the absence of a parameter')
     })
 })
+
+// MCP Apps negotiation. Every piece of the UI path can be right — the ui://
+// resource at text/html;profile=mcp-app, `_meta.ui.resourceUri` on the tool,
+// structuredContent, the shell's tool-result listener — and a host will still
+// show a text block, because per SEP-1865 it renders a template only for a
+// server that DECLARED the extension at initialize. Nothing else in the suite
+// looks at the handshake, which is how it stayed missing while everything
+// downstream passed.
+describe('MCP Apps extension negotiation', () => {
+    const UI_EXTENSION = 'io.modelcontextprotocol/ui'
+    const SHELL = 'ui://test/shell'
+
+    function substrateWithUi({ mimeType = 'text/html;profile=mcp-app' } = {}) {
+        const substrate = createMcpSubstrate()
+        substrate.registerResource('test-shell', SHELL, { mimeType }, async (uri) => ({
+            contents: [{ uri: uri.href, mimeType, text: '<div></div>' }],
+        }))
+        substrate.registerTool(
+            'ui_tool',
+            { description: 'renders ui', inputSchema: {}, _meta: { ui: { resourceUri: SHELL } } },
+            async () => ({ content: [] }),
+        )
+        return substrate
+    }
+
+    const uiCapabilityOf = (server) =>
+        server.server.getCapabilities().extensions?.[UI_EXTENSION]
+
+    it('declares the extension with the mime type the ui:// resource itself carries', () => {
+        const server = substrateWithUi().createServer()
+        assert.deepEqual(uiCapabilityOf(server), { mimeTypes: ['text/html;profile=mcp-app'] })
+    })
+
+    it('advertises whatever the resource declares, so a second UI content type needs no edit here', () => {
+        const server = substrateWithUi({ mimeType: 'text/html;profile=mcp-app;variant=next' }).createServer()
+        assert.deepEqual(uiCapabilityOf(server), { mimeTypes: ['text/html;profile=mcp-app;variant=next'] })
+    })
+
+    it('stays silent when the endpoint filters the shell out from under the tool', () => {
+        // The tool is bound, its template is not. Declaring here points a
+        // host at a ui:// it will fetch and not find.
+        const server = substrateWithUi().createServer({ allowedResources: ['mikser://*'] })
+        assert.equal(uiCapabilityOf(server), undefined)
+    })
+
+    it('stays silent when the tool names a template no resource declares', () => {
+        const substrate = createMcpSubstrate()
+        substrate.registerTool(
+            'ui_tool',
+            { description: 'renders ui', inputSchema: {}, _meta: { ui: { resourceUri: 'ui://test/absent' } } },
+            async () => ({ content: [] }),
+        )
+        assert.equal(uiCapabilityOf(substrate.createServer()), undefined)
+    })
+
+    it('stays silent when the bound template is not the one the tool asks for', () => {
+        // The discriminating case for the template check. A second ui://
+        // resource IS bound, so mime types are collected and the emptiness
+        // test passes — but the only UI tool points at the template that got
+        // filtered out, so nothing on this endpoint can actually render.
+        const substrate = createMcpSubstrate()
+        for (const [name, uri] of [['shell-a', 'ui://test/a'], ['shell-b', 'ui://test/b']]) {
+            substrate.registerResource(name, uri, { mimeType: 'text/html;profile=mcp-app' },
+                async (u) => ({ contents: [{ uri: u.href, text: '<div></div>' }] }))
+        }
+        substrate.registerTool(
+            'ui_tool',
+            { description: 'renders ui', inputSchema: {}, _meta: { ui: { resourceUri: 'ui://test/a' } } },
+            async () => ({ content: [] }),
+        )
+        const server = substrate.createServer({ allowedResources: ['ui://test/b'] })
+        assert.equal(uiCapabilityOf(server), undefined)
+    })
+
+    it('stays silent for a server with no UI at all', () => {
+        const substrate = createMcpSubstrate()
+        substrate.registerTool('plain', { description: 'plain', inputSchema: {} }, async () => ({ content: [] }))
+        assert.equal(uiCapabilityOf(substrate.createServer()), undefined)
+    })
+})
