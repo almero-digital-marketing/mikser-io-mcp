@@ -321,6 +321,11 @@ export function createMcpSubstrate() {
     // transport. Used to fan log notifications and list-changed
     // events out to every active client.
     const activeServers = new Set()
+    // Which endpoint each attached session server serves. Read by the
+    // live-replay path below: a registration that arrives AFTER a session is
+    // open still has to respect its scope, and this is the only record of
+    // what that session's scope was.
+    const serverEndpoints = new WeakMap()
     // Rolling buffer of recent log lines, surfaced via the
     // mikser://logs/recent resource. Sized to cover one or two
     // typical lifecycle cycles — large enough to debug a render
@@ -330,8 +335,28 @@ export function createMcpSubstrate() {
     const LOG_BUFFER_CAP = 500
     const logBuffer = []
 
+    // A registration may name the endpoints it belongs to, as
+    // `endpoints: ['apps']` in its config. Absent, it is bound everywhere —
+    // which is every registration that existed before this. Present, it is
+    // bound ONLY on those endpoints, so a package can own a route without its
+    // tools also turning up on /mcp.
+    //
+    // The key is stripped before the config reaches the SDK: `endpoints` is
+    // mikser's routing vocabulary, not part of a tool or resource definition,
+    // and passing it through would put it on the wire.
+    const boundHere = (config, endpoint) => {
+        const only = config?.endpoints
+        if (!only) return true
+        return Array.isArray(only) && only.includes(endpoint)
+    }
+    const withoutEndpoints = (config) => {
+        if (!config?.endpoints) return config
+        const { endpoints, ...rest } = config
+        return rest
+    }
+
     function bind(server, filters = {}) {
-        const { allowedTools, allowedResources, allowedPrompts } = filters
+        const { allowedTools, allowedResources, allowedPrompts, endpoint = null } = filters
         const bound = { tools: 0, resources: 0, prompts: 0 }
         // What the MCP Apps extension would be declared over, collected
         // from what actually got bound rather than from a constant: an
@@ -344,7 +369,8 @@ export function createMcpSubstrate() {
         const ownNames = new Set(registrations.tools.map(([name]) => name))
         for (const args of registrations.tools) {
             if (!matchesAny(args[0], allowedTools)) continue
-            server.registerTool(...args)
+            if (!boundHere(args[1], endpoint)) continue
+            server.registerTool(args[0], withoutEndpoints(args[1]), args[2])
             const template = args[1]?._meta?.ui?.resourceUri
             if (typeof template === 'string') uiTemplatesWanted.add(template)
             bound.tools++
@@ -396,6 +422,10 @@ export function createMcpSubstrate() {
             // target than the short `mikser-lifecycle` name).
             const uri = typeof args[1] === 'string' ? args[1] : args[0]
             if (!matchesAny(uri, allowedResources)) continue
+            // Metadata sits at args[2] only in the 4-argument static-URI
+            // form, which is the one a scoped registration uses.
+            const resourceConfig = args.length >= 4 ? args[2] : null
+            if (!boundHere(resourceConfig, endpoint)) continue
             if (typeof uri === 'string' && uri.startsWith('ui://')) {
                 uiTemplatesBound.add(uri)
                 // The mime type is the resource's own declaration — the
@@ -404,12 +434,15 @@ export function createMcpSubstrate() {
                 const mimeType = args[2]?.mimeType
                 if (typeof mimeType === 'string') uiMimeTypes.add(mimeType)
             }
-            server.registerResource(...args)
+            server.registerResource(...(resourceConfig
+                ? [args[0], args[1], withoutEndpoints(resourceConfig), args[3]]
+                : args))
             bound.resources++
         }
         for (const args of registrations.prompts) {
             if (!matchesAny(args[0], allowedPrompts)) continue
-            server.registerPrompt(...args)
+            if (!boundHere(args[1], endpoint)) continue
+            server.registerPrompt(args[0], withoutEndpoints(args[1]), args[2])
             bound.prompts++
         }
         // A tool's template is only usable if the resource carrying it got
@@ -455,14 +488,23 @@ export function createMcpSubstrate() {
             // fields the engine cares about keeps both surfaces exact without
             // pushing MCP's vocabulary into core.
             try {
-                coreRegisterTool(bareName(name), args[1] ?? {}, args[2])
+                // NOT mirrored when the registration names its endpoints. The
+                // engine registry is the CLI's surface, and a tool scoped to
+                // one MCP route does not belong on it — `mikser_app_action`
+                // is app-callable by spec and has no meaning typed at a
+                // prompt. It also closed a leak: bind()'s core-registry loop
+                // re-exposes engine tools on every endpoint that does not
+                // shadow them by name, so a mirrored scoped tool came back on
+                // /mcp through the side door.
+                if (!args[1]?.endpoints) coreRegisterTool(bareName(name), args[1] ?? {}, args[2])
             } catch (err) {
                 runtime.engine?.logger?.debug('Tool %s not mirrored to the engine registry: %s', name, err.message)
             }
             let replayed = 0
             const replayErrors = []
             for (const s of activeServers) {
-                try { s.registerTool(...args); replayed++ }
+                if (!boundHere(args[1], serverEndpoints.get(s) ?? null)) continue
+                try { s.registerTool(args[0], withoutEndpoints(args[1]), args[2]); replayed++ }
                 catch (err) { replayErrors.push(err.message) }
             }
             const log = runtime.engine?.logger
@@ -481,7 +523,11 @@ export function createMcpSubstrate() {
             let replayed = 0
             const replayErrors = []
             for (const s of activeServers) {
-                try { s.registerResource(...args); replayed++ }
+                const cfg = args.length >= 4 ? args[2] : null
+                if (!boundHere(cfg, serverEndpoints.get(s) ?? null)) continue
+                try { s.registerResource(...(cfg
+                    ? [args[0], args[1], withoutEndpoints(cfg), args[3]]
+                    : args)); replayed++ }
                 catch (err) { replayErrors.push(err.message) }
             }
             const log = runtime.engine?.logger
@@ -500,7 +546,8 @@ export function createMcpSubstrate() {
             let replayed = 0
             const replayErrors = []
             for (const s of activeServers) {
-                try { s.registerPrompt(...args); replayed++ }
+                if (!boundHere(args[1], serverEndpoints.get(s) ?? null)) continue
+                try { s.registerPrompt(args[0], withoutEndpoints(args[1]), args[2]); replayed++ }
                 catch (err) { replayErrors.push(err.message) }
             }
             const log = runtime.engine?.logger
@@ -540,12 +587,13 @@ export function createMcpSubstrate() {
         //   allowedResources: ['mikser://lifecycle', 'mikser://logs/*']
         // Omit a filter (or pass '*') to allow everything in that
         // category — that's the backward-compat default.
-        createServer({ allowedTools, allowedResources, allowedPrompts } = {}) {
+        createServer({ allowedTools, allowedResources, allowedPrompts, endpoint = null } = {}) {
             const server = new McpServer(
                 serverImplementation(),
                 { capabilities: { tools: {}, resources: {}, logging: {} } },
             )
-            const bound = bind(server, { allowedTools, allowedResources, allowedPrompts })
+            serverEndpoints.set(server, endpoint)
+            const bound = bind(server, { allowedTools, allowedResources, allowedPrompts, endpoint })
             // Before connect, per the SDK — registerCapabilities throws once a
             // transport is attached, and this runs per session at mount time.
             if (bound.ui?.templates.length && bound.ui.mimeTypes.length) {
@@ -560,6 +608,35 @@ export function createMcpSubstrate() {
                 bound.prompts, registrations.prompts.length,
             )
             return server
+        },
+
+        // Mount ANOTHER MCP route from this same substrate.
+        //
+        // The seam exists because a package that owns a surface should own its
+        // route too — mikser-io-mcp-app serves MCP Apps at /apps — while
+        // sessions, transport, the auth rule and the protected-resource
+        // metadata stay in one place. The alternative is a second package
+        // hand-rolling all of that, and the one project that hand-rolled MCP
+        // auth shipped a silent bypass.
+        //
+        // `name` is not decoration: it is what a registration's
+        // `endpoints: ['<name>']` matches, so the caller's tools bind here and
+        // nowhere else. Pass `tools` / `resources` / `prompts` to additionally
+        // filter what of the SHARED surface this route exposes.
+        mountEndpoint({ name, path, auth, token, allowRemote, tools, resources, prompts } = {}) {
+            if (!name) {
+                throw new Error('mountEndpoint: `name` is required — it is what endpoint-scoped registrations match and what the route is labelled with.')
+            }
+            const app = runtime.options.app
+            if (!app) {
+                // Out loud: without --server there is no Express to mount on,
+                // and a surface that silently never appears is the failure
+                // this message exists to prevent.
+                throw new Error(`mountEndpoint(${name}): requires runtime.options.app — run mikser with --server.`)
+            }
+            const at = path ?? `/${name}`
+            mountEndpointOn(app, this, at, { auth, token, allowRemote, tools, resources, prompts }, name)
+            return { name, path: at }
         },
         attach(server) {
             activeServers.add(server)
@@ -1184,7 +1261,7 @@ export async function mountMcpOnExpress(app, substrate, defaultPath = '/mcp') {
 
     if (endpoints && Object.keys(endpoints).length > 0) {
         for (const [name, ep] of Object.entries(endpoints)) {
-            mountEndpoint(app, substrate, `${base}/${name}`, ep, name)
+            mountEndpointOn(app, substrate, `${base}/${name}`, ep, name)
         }
     } else {
         // Backward-compat single endpoint. With no `mcp.endpoints`
@@ -1192,7 +1269,7 @@ export async function mountMcpOnExpress(app, substrate, defaultPath = '/mcp') {
         // safe default as a per-endpoint config with no token. The
         // boot log line itself (from mountEndpoint) shows the state;
         // no extra warning needed because the default IS the safe one.
-        mountEndpoint(app, substrate, defaultPath, {}, null)
+        mountEndpointOn(app, substrate, defaultPath, {}, null)
     }
 }
 
@@ -1326,7 +1403,7 @@ function isInitializeRequest(body) {
     return body?.method === 'initialize'
 }
 
-function mountEndpoint(app, substrate, path, ep, endpointName) {
+function mountEndpointOn(app, substrate, path, ep, endpointName) {
     const transports = new Map()
 
     // ADR-0012: `auth` is a verifier (mikser-io-auth's oauth()/jwt(), or any
@@ -1440,6 +1517,7 @@ function mountEndpoint(app, substrate, path, ep, endpointName) {
             allowedTools:     ep.tools,
             allowedResources: ep.resources,
             allowedPrompts:   ep.prompts,
+            endpoint:         endpointName,
         })
         const transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
@@ -1625,11 +1703,10 @@ export function mcp(options = {}) {
     requestReport()
     runtime.options.mcpPath = options.path ?? '/mcp'
 
-    // Compose the MCP-UI surface in the same package — shell
-    // resource, mikser_preview_ui, mikser_ui_action, mikser_preview_render,
-    // forwardToHandler, the mcp-ui/modes discovery resource.
-    // Pass the full core args through so previewPlugin gets
-    // findEntity / findEntities too.
+    // The preview-render tool, composed in the same package. The MCP Apps
+    // surface that used to sit alongside it lives in mikser-io-mcp-app now,
+    // on its own route — see `substrate.mountEndpoint` and `endpoints:`
+    // scoping above. Pass the full core args through.
     previewPlugin(core)
 
     onLoaded(async () => {

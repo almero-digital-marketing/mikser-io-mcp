@@ -14,7 +14,8 @@ MCP (Model Context Protocol) substrate and tools for [mikser-io](https://github.
   - *Diagnostics* — `mikser_explain` (why an entity did or did not re-render), `mikser_build_report` (what a cycle did, with history), `mikser_verify` (output folder vs. recorded snapshots), `mikser_read_output` (the bytes currently on disk for a destination).
   - *Layouts* — `mikser_layouts_inspect` (template + variables + sample entities), registered by `mikser-io-layouts` itself.
   - *Liveness* — `mikser_ping`, which also reports how the caller is authenticated and when that credential expires.
-- **The MCP-UI surface** — `ui://mikser/preview-ui-shell` resource (MCP Apps spec shell), `mikser_preview_ui` (render an entity's `mcpUi` layout to the spec), `mikser_ui_action` (action delivery + optional HMAC-signed webhook forwarding), `mcp-ui/modes` resource for layout discovery, plus `mikser_preview_render` for rendering an entity through the pipeline and returning a clickable preview URL.
+- **`mikser_preview_render`** — render an entity through the pipeline and return a clickable URL serving the chain's final output (PDF for a `*.html-pdf.*` layout, and so on).
+- **Endpoint scoping and `substrate.mountEndpoint`** — a package can own its own MCP route from this substrate, with its registrations bound only there. [mikser-io-mcp-app](https://github.com/almero-digital-marketing/mikser-io-mcp-app) uses it to serve MCP Apps (SEP-1865) at `/apps`; the interactive-UI surface used to live here under the mcp-ui vocabulary and moved there.
 
 ## Also reachable from the CLI
 
@@ -216,7 +217,7 @@ resends its stored id out of habit still gets a session rather than looping on
 ## Documentation
 
 - [Full MCP tour, twelve worked scenarios, every tool and resource](./documentation/mcp.md)
-- [ADR-0008 — MCP-UI rendering and action delivery](./documentation/decisions/0008-mcp-ui-action-delivery.md)
+- MCP Apps rendering and action delivery moved to [mikser-io-mcp-app](https://github.com/almero-digital-marketing/mikser-io-mcp-app) (its ADR-0001)
 
 ## License
 

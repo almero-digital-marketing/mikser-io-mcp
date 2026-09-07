@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import { createMcpSubstrate, wireLoggerToMcp } from '../../index.js'
-import { runtime, invokeTool, toolResultText, writeEntitySource, registerTool } from 'mikser-io'
+import { runtime, invokeTool, toolResultText, writeEntitySource, registerTool, toolNames } from 'mikser-io'
 
 // A minimal stand-in for @modelcontextprotocol/sdk's McpServer. We don't
 // want the tests to depend on a real transport / session — they verify
@@ -701,5 +701,99 @@ describe('MCP Apps extension negotiation', () => {
         const substrate = createMcpSubstrate()
         substrate.registerTool('plain', { description: 'plain', inputSchema: {} }, async () => ({ content: [] }))
         assert.equal(uiCapabilityOf(substrate.createServer()), undefined)
+    })
+})
+
+// Endpoint scoping. A package that owns its own route — mikser-io-mcp-app
+// serves MCP Apps at /apps — must be able to keep its tools OFF the shared
+// /mcp surface. Without this the app-callable action tool would be listed to
+// the agent on the default endpoint, which is the one place the spec says it
+// must not appear.
+describe('endpoint-scoped registrations', () => {
+    // A distinct name per test: the ENGINE tool registry is process-global and
+    // has no reset, so a name reused across tests leaks between them through
+    // bind()'s core-registry loop and makes a negative assertion pass or fail
+    // for the wrong reason. Cost one confused debugging round.
+    const scopedTool = (name, endpoints) => [
+        name,
+        { description: 'app only', inputSchema: {}, ...(endpoints ? { endpoints } : {}) },
+        async () => ({ content: [] }),
+    ]
+
+    function toolsOn(endpoint, registration) {
+        const substrate = createMcpSubstrate()
+        substrate.registerTool(...registration)
+        const server = substrate.createServer({ endpoint })
+        // The SDK keeps registered tools on the underlying server; read them
+        // back through its own registry rather than guessing.
+        return new Set(Object.keys(server.server._registeredTools ?? server._registeredTools ?? {}))
+    }
+
+    it('binds a scoped tool on the endpoint it names', () => {
+        assert.ok(toolsOn('apps', scopedTool('mikser_scope_bind', ['apps'])).has('mikser_scope_bind'))
+    })
+
+    it('keeps a scoped tool off every other endpoint, the default included', () => {
+        assert.ok(!toolsOn(null, scopedTool('mikser_scope_off', ['apps'])).has('mikser_scope_off'),
+            'a tool scoped to apps must not bind on the default /mcp endpoint')
+        assert.ok(!toolsOn('other', scopedTool('mikser_scope_off2', ['apps'])).has('mikser_scope_off2'))
+    })
+
+    it('binds an unscoped tool everywhere, as everything did before scoping existed', () => {
+        assert.ok(toolsOn(null, scopedTool('mikser_scope_all', null)).has('mikser_scope_all'))
+        assert.ok(toolsOn('apps', scopedTool('mikser_scope_all2', null)).has('mikser_scope_all2'))
+    })
+
+    // Registration can happen AFTER a session is open — a plugin loading late,
+    // a tool added on a rebuild — and that path replays onto attached servers
+    // instead of going through bind(). It has to respect scope too, or the
+    // app-callable tool leaks onto whichever sessions happen to be live.
+    it('replays a late scoped registration only onto sessions of that endpoint', () => {
+        const substrate = createMcpSubstrate()
+        const appsSession = substrate.createServer({ endpoint: 'apps' })
+        const plainSession = substrate.createServer({ endpoint: null })
+        substrate.attach(appsSession)
+        substrate.attach(plainSession)
+
+        substrate.registerTool(...scopedTool('mikser_scope_replay', ['apps']))
+
+        const has = (session) => Object.keys(session._registeredTools ?? {}).includes('mikser_scope_replay')
+        assert.equal(has(appsSession), true, 'the apps session should receive a tool scoped to apps')
+        assert.equal(has(plainSession), false, 'a default-endpoint session must not receive a tool scoped to apps')
+    })
+
+    it('replays an unscoped late registration onto every session', () => {
+        const substrate = createMcpSubstrate()
+        const appsSession = substrate.createServer({ endpoint: 'apps' })
+        const plainSession = substrate.createServer({ endpoint: null })
+        substrate.attach(appsSession)
+        substrate.attach(plainSession)
+
+        substrate.registerTool(...scopedTool('mikser_scope_replay_all', null))
+
+        const has = (session) => Object.keys(session._registeredTools ?? {}).includes('mikser_scope_replay_all')
+        assert.equal(has(appsSession), true)
+        assert.equal(has(plainSession), true)
+    })
+
+    it('keeps a scoped tool out of the engine registry, which is the CLI surface', () => {
+        // Two reasons, and the second is the one that bites: an app-callable
+        // tool typed at a prompt means nothing, AND bind()'s core-registry
+        // loop re-exposes engine tools on endpoints that do not shadow them
+        // by name — so a mirrored scoped tool reappears on /mcp by the side
+        // door. Found exactly that way.
+        const substrate = createMcpSubstrate()
+        substrate.registerTool(...scopedTool('mikser_scope_nomirror', ['apps']))
+        assert.ok(!toolNames().includes('scope_nomirror'),
+            'a tool scoped to an MCP endpoint must not land in the engine registry')
+
+        substrate.registerTool(...scopedTool('mikser_scope_mirror', null))
+        assert.ok(toolNames().includes('scope_mirror'),
+            'an unscoped tool still mirrors, as it always did')
+    })
+
+    it('refuses to mount a route with no name', () => {
+        const substrate = createMcpSubstrate()
+        assert.throws(() => substrate.mountEndpoint({ path: '/apps' }), /`name` is required/)
     })
 })
