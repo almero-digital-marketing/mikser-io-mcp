@@ -214,3 +214,84 @@ describe('MCP OAuth discovery (RFC 9728)', () => {
         )
     })
 })
+
+// Per-CALL authorisation. The endpoint gate answers "may this caller reach
+// this route"; a surface that serves both a public app and a restricted one
+// needs "may this caller make THIS call" too — and it has to be answered
+// before the JSON-RPC dispatch. A tool handler can only return a tool RESULT,
+// and a result saying "not allowed" is a successful response that no client
+// reads as "sign in": the user is refused with no way to authenticate.
+describe('MCP endpoint per-call authorization', () => {
+    const callBody = (name) => ({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name } })
+
+    const withHook = (authorizeCall, ep = {}) =>
+        mount({ app: { allowRemote: true, authorizeCall, ...ep } })
+
+    it('lets a call through when the hook allows it', async () => {
+        const app = await withHook(() => null)
+        const req = fakeReq(); req.body = callBody('public_tool')
+        const { allowed } = await call(app, '/mcp/app', req)
+        assert.equal(allowed, true)
+    })
+
+    it('refuses before dispatch, with the status the hook asks for', async () => {
+        const app = await withHook(({ call: c }) =>
+            c?.params?.name === 'private_tool' ? { status: 403, error: 'not in group' } : null)
+        const req = fakeReq(); req.body = callBody('private_tool')
+        const { allowed, res } = await call(app, '/mcp/app', req)
+        assert.equal(allowed, false, 'the tool must never run')
+        assert.equal(res.statusCode, 403)
+        assert.equal(res.body.error.message, 'not in group')
+        assert.equal(res.body.id, 7, 'the refusal answers the call it refused')
+    })
+
+    it('sees the principal the endpoint gate resolved', async () => {
+        const seen = []
+        const app = await withHook(({ principal }) => { seen.push(principal); return null })
+        const req = fakeReq(); req.body = callBody('x')
+        await call(app, '/mcp/app', req)
+        assert.equal(seen.length, 1)
+        assert.equal(seen[0].subject, 'anonymous', 'an open route still names its caller')
+    })
+
+    it('refuses a whole batch on its first refusal', async () => {
+        // Half a batch is not something a client can act on.
+        let asked = 0
+        const app = await withHook(({ call: c }) => { asked++; return c.id === 1 ? null : { status: 403, error: 'no' } })
+        const req = fakeReq()
+        req.body = [{ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'a' } },
+                    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'b' } },
+                    { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'c' } }]
+        const { allowed, res } = await call(app, '/mcp/app', req)
+        assert.equal(allowed, false)
+        assert.equal(res.statusCode, 403)
+        assert.equal(asked, 2, 'it stops at the first refusal rather than judging the rest')
+    })
+
+    it('a 401 refusal carries a challenge, so the client knows where to sign in', async () => {
+        const verifier = {
+            verify: async () => null,
+            authorizationServers: ['https://auth.mikser.test'],
+        }
+        const app = await mount({ app: { allowRemote: true, authorizeCall: () => ({ status: 401, error: 'sign in' }) } })
+        void verifier
+        const req = fakeReq(); req.body = callBody('private_tool')
+        const { res } = await call(app, '/mcp/app', req)
+        assert.equal(res.statusCode, 401)
+    })
+
+    it('answers 500 rather than dispatching when the hook throws', async () => {
+        const app = await withHook(() => { throw new Error('boom') })
+        const req = fakeReq(); req.body = callBody('x')
+        const { allowed, res } = await call(app, '/mcp/app', req)
+        assert.equal(allowed, false, 'a broken policy must not fail open')
+        assert.equal(res.statusCode, 500)
+    })
+
+    it('is absent by default — an endpoint without the hook dispatches as before', async () => {
+        const app = await mount({ app: { allowRemote: true } })
+        const req = fakeReq(); req.body = callBody('x')
+        const { allowed } = await call(app, '/mcp/app', req)
+        assert.equal(allowed, true)
+    })
+})

@@ -638,7 +638,7 @@ export function createMcpSubstrate() {
         // `endpoints: ['<name>']` matches, so the caller's tools bind here and
         // nowhere else. Pass `tools` / `resources` / `prompts` to additionally
         // filter what of the SHARED surface this route exposes.
-        mountEndpoint({ name, path, auth, token, allowRemote, tools, resources, prompts, serverInfo } = {}) {
+        mountEndpoint({ name, path, auth, token, allowRemote, tools, resources, prompts, serverInfo, authorizeCall } = {}) {
             if (!name) {
                 throw new Error('mountEndpoint: `name` is required — it is what endpoint-scoped registrations match and what the route is labelled with.')
             }
@@ -650,7 +650,7 @@ export function createMcpSubstrate() {
                 throw new Error(`mountEndpoint(${name}): requires runtime.options.app — run mikser with --server.`)
             }
             const at = path ?? `/${name}`
-            mountEndpointOn(app, this, at, { auth, token, allowRemote, tools, resources, prompts, serverInfo }, name)
+            mountEndpointOn(app, this, at, { auth, token, allowRemote, tools, resources, prompts, serverInfo, authorizeCall }, name)
             return { name, path: at }
         },
         attach(server) {
@@ -1481,6 +1481,57 @@ function mountEndpointOn(app, substrate, path, ep, endpointName) {
             return
         }
         req.principal = outcome.principal
+
+        // Per-CALL authorisation, before the JSON-RPC dispatch.
+        //
+        // The endpoint's own gate answers one question — may this caller
+        // reach this route — and some surfaces need a second: may this caller
+        // make THIS call. mikser-io-mcp-app asks it per layout, because one
+        // app route can serve a public registration form and a restricted
+        // approval app.
+        //
+        // It has to happen HERE, not inside the tool. A tool handler can only
+        // return a tool RESULT, and a result saying "not allowed" is a
+        // successful response that no client reads as "sign in" — the user is
+        // refused with no way to authenticate. Refusing the POST with 401 and
+        // a challenge is what makes a host's "sign in when the server asks"
+        // flow work at all.
+        //
+        // Refusal shape: `{ status, error, scope? }`, or nothing to allow.
+        if (typeof ep.authorizeCall === 'function') {
+            // A batch is refused as a whole on its first refusal: half a batch
+            // is not something a client can act on.
+            const calls = Array.isArray(body) ? body : [body]
+            for (const call of calls) {
+                let refusal
+                try {
+                    refusal = await ep.authorizeCall({ call, principal: req.principal, req })
+                } catch (err) {
+                    runtime.engine?.logger?.error(
+                        'MCP authorizeCall threw at %s: %s', path, err.message)
+                    res.status(500).json({
+                        jsonrpc: '2.0',
+                        error: { code: -32001, message: 'Authorization failed' },
+                        id: call?.id ?? null,
+                    })
+                    return
+                }
+                if (!refusal) continue
+                const status = refusal.status ?? 403
+                runtime.engine?.logger?.debug(
+                    'MCP call denied at %s: %s %s (subject=%s)',
+                    path, call?.method, status, req.principal?.subject ?? 'anonymous')
+                if (status === 401 || status === 403) {
+                    challenge(req, res, verifier, path, refusal)
+                }
+                res.status(status).json({
+                    jsonrpc: '2.0',
+                    error: { code: -32001, message: refusal.error ?? 'Not allowed' },
+                    id: call?.id ?? null,
+                })
+                return
+            }
+        }
 
         const sessionId = req.headers['mcp-session-id']
         if (sessionId && transports.has(sessionId)) {
