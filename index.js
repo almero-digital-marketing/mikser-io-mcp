@@ -427,7 +427,15 @@ export function createMcpSubstrate() {
             // Filter on the URI since that's the addressable identifier
             // (`mikser://lifecycle` reads more naturally as the filter
             // target than the short `mikser-lifecycle` name).
-            const uri = typeof args[1] === 'string' ? args[1] : args[0]
+            // A ResourceTemplate registration has an object here, not a
+            // string, and its addressable identity is the PATTERN — the same
+            // thing a client sees in resources/templates/list. Falling back to
+            // the registration's name meant a URI-shaped filter silently
+            // dropped every template, which is how mikser-io-mcp-app's data
+            // surface came out missing from its own endpoint.
+            const uri = typeof args[1] === 'string'
+                ? args[1]
+                : (args[1]?.uriTemplate?.toString?.() ?? args[0])
             if (!matchesAny(uri, allowedResources)) continue
             // Metadata sits at args[2] only in the 4-argument static-URI
             // form, which is the one a scoped registration uses.

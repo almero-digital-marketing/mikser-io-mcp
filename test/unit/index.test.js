@@ -797,3 +797,36 @@ describe('endpoint-scoped registrations', () => {
         assert.throws(() => substrate.mountEndpoint({ path: '/apps' }), /`name` is required/)
     })
 })
+
+// Resource TEMPLATES are addressed by their pattern, not by the name they were
+// registered under. Keying the filter on the name meant an endpoint whose
+// allowedResources listed URIs dropped every template it was supposed to
+// expose — found when mikser-io-mcp-app's data surface came out missing from
+// its own route, with no error anywhere.
+describe('endpoint filters and resource templates', () => {
+    const PATTERN = 'mikser://apps/{layout}/{+path}'
+    // Enough of a ResourceTemplate for bind(): the pattern, and a list
+    // callback slot. The real class comes from the SDK; what bind() reads is
+    // exactly this much.
+    const template = () => ({ uriTemplate: { toString: () => PATTERN }, listCallback: undefined })
+
+    function boundTemplates(allowedResources) {
+        const substrate = createMcpSubstrate()
+        substrate.registerResource('data-surface', template(), { title: 'data' },
+            async () => ({ contents: [] }))
+        const server = substrate.createServer({ allowedResources })
+        return Object.keys(server._registeredResourceTemplates ?? {})
+    }
+
+    it('binds a template when the filter names its pattern', () => {
+        assert.deepEqual(boundTemplates([PATTERN]), ['data-surface'])
+    })
+
+    it('binds a template when the endpoint filters nothing', () => {
+        assert.deepEqual(boundTemplates(null), ['data-surface'])
+    })
+
+    it('drops a template the filter does not name', () => {
+        assert.deepEqual(boundTemplates(['mikser://something/else']), [])
+    })
+})
