@@ -118,7 +118,13 @@ const ICON_URL = 'https://raw.githubusercontent.com/almero-digital-marketing/mik
 // What this server calls itself in the initialize response. Exported so it
 // can be asserted on without reaching into the SDK's private state — the
 // values are ours; that they survive the SDK is what the live check covers.
-export function serverImplementation() {
+// Who a client thinks it is talking to. `overrides` exists because not every
+// route is mikser talking to a developer: an endpoint serving a SITE's apps to
+// that site's visitors should show the site's name and the site's icon, not
+// mikser's mark — the engine is not the brand on that surface. Overriding
+// `icons` REPLACES the list rather than adding to it, so a caller can also say
+// "no icon" with `icons: []` and not inherit ours.
+export function serverImplementation(overrides = {}) {
     return {
         name:    'mikser-io',
         // `name` is the programmatic identifier; `title` is what a UI shows.
@@ -130,6 +136,7 @@ export function serverImplementation() {
             { src: ICON_DATA_URI, mimeType: 'image/svg+xml', sizes: ['any'] },
         ],
         websiteUrl: 'https://github.com/almero-digital-marketing/mikser-io',
+        ...overrides,
     }
 }
 
@@ -587,9 +594,9 @@ export function createMcpSubstrate() {
         //   allowedResources: ['mikser://lifecycle', 'mikser://logs/*']
         // Omit a filter (or pass '*') to allow everything in that
         // category — that's the backward-compat default.
-        createServer({ allowedTools, allowedResources, allowedPrompts, endpoint = null } = {}) {
+        createServer({ allowedTools, allowedResources, allowedPrompts, endpoint = null, serverInfo } = {}) {
             const server = new McpServer(
-                serverImplementation(),
+                serverImplementation(serverInfo),
                 { capabilities: { tools: {}, resources: {}, logging: {} } },
             )
             serverEndpoints.set(server, endpoint)
@@ -623,7 +630,7 @@ export function createMcpSubstrate() {
         // `endpoints: ['<name>']` matches, so the caller's tools bind here and
         // nowhere else. Pass `tools` / `resources` / `prompts` to additionally
         // filter what of the SHARED surface this route exposes.
-        mountEndpoint({ name, path, auth, token, allowRemote, tools, resources, prompts } = {}) {
+        mountEndpoint({ name, path, auth, token, allowRemote, tools, resources, prompts, serverInfo } = {}) {
             if (!name) {
                 throw new Error('mountEndpoint: `name` is required — it is what endpoint-scoped registrations match and what the route is labelled with.')
             }
@@ -635,7 +642,7 @@ export function createMcpSubstrate() {
                 throw new Error(`mountEndpoint(${name}): requires runtime.options.app — run mikser with --server.`)
             }
             const at = path ?? `/${name}`
-            mountEndpointOn(app, this, at, { auth, token, allowRemote, tools, resources, prompts }, name)
+            mountEndpointOn(app, this, at, { auth, token, allowRemote, tools, resources, prompts, serverInfo }, name)
             return { name, path: at }
         },
         attach(server) {
@@ -1518,6 +1525,7 @@ function mountEndpointOn(app, substrate, path, ep, endpointName) {
             allowedResources: ep.resources,
             allowedPrompts:   ep.prompts,
             endpoint:         endpointName,
+            serverInfo:       ep.serverInfo,
         })
         const transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
